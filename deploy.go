@@ -99,6 +99,20 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	time.Sleep(500 * time.Millisecond)
 
+	// PreStage (optional): if the operator asked for it (req.PreStage),
+	// pre-download every asset the deploy will need into the Job's
+	// stageCache NOW, while the laptop's current internet path is still up.
+	// This matters when the laptop's only internet is via the router being
+	// flashed or reconfigured (STA mode): the flash/install steps later
+	// consume the staged bytes instead of fetching live. Runs immediately
+	// after verify (glModel/isStockGL from the SSH probe are required to
+	// pick the right image/package URLs) and before flash. Failures are
+	// non-fatal — the existing live-fetch → router-wget → feed fallbacks
+	// remain on a cache miss.
+	if req.PreStage {
+		runPreStage(job, client, isStockGL, glModel)
+	}
+
 	// Step 1: Flash OpenWrt on stock GL.iNet (skipped if already OpenWrt)
 	job.setStep(1, "running", "")
 	if isStockGL {
@@ -1030,6 +1044,98 @@ func httpGetFileOrEmpty(url string) []byte {
 		return nil
 	}
 	return data
+}
+
+// stageAssetURLs returns the ordered list of asset URLs a PreStage run must
+// download for the given router state:
+//
+//   - stock GL.iNet router that will be flashed (isStockGL): the OpenWrt
+//     sysupgrade image for the detected model (when known) PLUS the
+//     tollgate-wrt package in BOTH formats — the post-flash package manager
+//     is only known after the reboot, and staging both guarantees a cache
+//     hit whichever one the install step probes.
+//   - router already on OpenWrt: only the package format matching its live
+//     package manager (apk vs opkg). An empty/unknown pkgMgr stages both so
+//     the deploy still works offline.
+//
+// Unknown GL models contribute no image URL (the flash step reports its own
+// actionable "unknown model" error); the package formats are still staged so
+// an operator can fix the model table and re-deploy offline.
+func stageAssetURLs(isStockGL bool, glModel, pkgMgr string) []string {
+	urls := []string{}
+	if isStockGL {
+		if img, ok := glModelMap[glModel]; ok {
+			urls = append(urls, img.URL())
+		}
+		urls = append(urls, tollgatePkgURL, tollgatePkgAPKURL)
+		return urls
+	}
+	switch pkgMgr {
+	case "apk":
+		urls = append(urls, tollgatePkgAPKURL)
+	case "opkg":
+		urls = append(urls, tollgatePkgURL)
+	default: // unknown — stage both so a later probe hits the cache
+		urls = append(urls, tollgatePkgURL, tollgatePkgAPKURL)
+	}
+	return urls
+}
+
+// runPreStage is the PreStage wiring point called from runDeployment right
+// after verify (so glModel/isStockGL are known) and before flash. It probes
+// the router's package manager (when the router is already OpenWrt — a stock
+// GL.iNet router will be flashed to the pinned OpenWrt release whose package
+// manager stageAssetURLs covers by staging both formats), picks the asset
+// URLs for the router state, and stages them into the Job's stageCache.
+// Failures are logged but non-fatal: the flash/install steps keep their
+// live-fetch → router-wget → feed fallbacks on a cache miss.
+func runPreStage(job *Job, client *ssh.Client, isStockGL bool, glModel string) {
+	pkgMgr := ""
+	if !isStockGL && client != nil {
+		pkgMgr = strings.TrimSpace(sshRun(client, "command -v apk >/dev/null 2>&1 && echo apk || echo opkg"))
+	}
+	urls := stageAssetURLs(isStockGL, glModel, pkgMgr)
+	if len(urls) == 0 {
+		job.addLog("PreStage: nothing to stage for this router state")
+		return
+	}
+	job.addLog(fmt.Sprintf("PreStage: downloading %d asset(s) to staging cache...", len(urls)))
+	failed := stageAssets(job, urls)
+	if len(failed) > 0 {
+		for _, u := range failed {
+			job.addLog("PreStage: could not stage " + truncate(u, 100) + " — deploy will fall back to live download")
+		}
+	}
+	staged := len(urls) - len(failed)
+	job.addLog(fmt.Sprintf("PreStage: %d/%d asset(s) staged", staged, len(urls)))
+}
+
+// stageAssets downloads every URL in urls into the Job's stageCache (keyed
+// by the exact URL) unless that URL is already staged. Already-cached URLs
+// are skipped — staging is idempotent, so re-running it (e.g. a retried
+// deploy sharing the Job) performs zero network fetches. Uses
+// downloadWithRetry (3 attempts, 4xx short-circuit) for every asset, the
+// same reliability pattern as the flash-image download. Returns the URLs
+// that failed to stage; callers log them and continue, because the
+// flash/install steps fall back to live fetch → router-side wget → feed on
+// a cache miss.
+func stageAssets(job *Job, urls []string) []string {
+	var failed []string
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		if _, ok := job.stagedAsset(u); ok {
+			continue
+		}
+		data, err := downloadWithRetry(u, 3, 2*time.Second)
+		if err != nil || len(data) == 0 {
+			failed = append(failed, u)
+			continue
+		}
+		job.stageAsset(u, data)
+	}
+	return failed
 }
 
 // extractIPKFilename scans an OpenWrt package directory listing (HTML) and
