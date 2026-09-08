@@ -72,6 +72,77 @@ routers on your LAN and deploys the tollgate-wrt backend over SSH.
    all-caps) and open any website — the captive portal appears with payment
    options.
 
+## Testing
+
+No release needed — the wizard is a single binary, so you can run the latest
+build directly from the repo. This is the fastest way to try it on a router.
+
+### 1. Quick test (interactive, browser UI)
+
+Download, run, and open the web UI — nothing else to install:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/OpenTollGate/tollgate-installer/main/install-and-test.sh)
+```
+
+The script auto-detects your OS/arch, downloads the matching binary, and serves
+the UI at `http://localhost:8099` (auto-picks a free port if taken). Drive the
+wizard in the browser exactly as in **Quick start** step 5.
+
+### 2. Full router test (headless, no browser)
+
+Same command plus a router IP and credentials — the script deploys TollGate
+over SSH and verifies the router afterward:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/OpenTollGate/tollgate-installer/main/install-and-test.sh) \
+    <ROUTER_IP> <ROOT_PASSWORD> <LIGHTNING_ADDRESS>
+```
+
+Example (fresh-reset GL.iNet, empty root password):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/OpenTollGate/tollgate-installer/main/install-and-test.sh) \
+    192.168.1.1 '' you@walletofsatoshi.com
+```
+
+It runs these steps automatically:
+
+1. Long-runs the installer, pings `/api/scan` for detected routers
+2. POSTs `/api/deploy` with your router IP / password / Lightning address
+3. Polls `/api/status/<job_id>` until all deploy steps complete
+4. SSHes in and verifies: hostname, ports (`:80 :2050 :2121`), `tollgate.lan`
+   DNS, LNURL in `identities.json`, captive portal, TollGate health ad
+5. Prints a clear `Deploy COMPLETE` / `Deploy FAILED` result
+
+### 3. Run the latest code without curl
+
+Just clone, build, and go:
+
+```bash
+git clone https://github.com/OpenTollGate/tollgate-installer.git
+cd tollgate-installer
+go build -o tollgate-installer .
+./tollgate-installer            # serves at :8099
+# or on another port:
+./tollgate-installer -port 8200
+```
+
+### API endpoints (what the wizard exposes)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Web UI |
+| `/api/scan` | GET | Discover routers on LAN |
+| `/api/deploy` | POST | Start a deploy job |
+| `/api/status/<id>` | GET | Poll deploy progress |
+| `/api/wifi-scan` | GET | Scan SSIDs (STA/repeater mode) |
+
+> **Note:** `felixfelix-bot`-owned clones may serve a pre-release build. The
+> canonical source is `OpenTollGate/tollgate-installer`. If the raw URL above
+> 404s, the PR with `install-and-test.sh` hasn't merged yet — use option 3
+> (clone + build) until it does.
+
 ## What the wizard does
 
 The deployment runs a sequence of steps over SSH:
