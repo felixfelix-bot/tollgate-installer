@@ -68,6 +68,13 @@ type Job struct {
 	Steps  []Step     `json:"steps"`
 	Log    []LogEntry `json:"log"`
 	Error  string     `json:"error,omitempty"`
+	// stageCache holds pre-downloaded deploy assets keyed by the exact
+	// asset URL, populated by the PreStage phase (stageAssets) so the
+	// flash/install steps can consume staged bytes without live network.
+	// Guarded by j.mu — the cache deliberately lives on the Job (which may
+	// outlive a single deployRequest), NOT on deployRequest. Not serialized
+	// to JSON (unexported; handleStatus builds an explicit snapshot).
+	stageCache map[string][]byte
 }
 
 var (
@@ -77,11 +84,12 @@ var (
 
 func newJob(ip string) *Job {
 	return &Job{
-		IP:     ip,
-		Status: "running",
-		Step:   0,
-		Steps:  deploySteps(),
-		Log:    []LogEntry{},
+		IP:         ip,
+		Status:     "running",
+		Step:       0,
+		Steps:      deploySteps(),
+		Log:        []LogEntry{},
+		stageCache: map[string][]byte{},
 	}
 }
 
@@ -101,6 +109,30 @@ func (j *Job) setStep(i int, status, detail string) {
 		}
 	}
 	j.mu.Unlock()
+}
+
+// stageAsset stores pre-downloaded asset bytes in the Job's stage cache,
+// keyed by the exact source URL. Guarded by j.mu. A zero-length payload is
+// not cached — an empty body means the fetch produced nothing usable.
+func (j *Job) stageAsset(url string, data []byte) {
+	if url == "" || len(data) == 0 {
+		return
+	}
+	j.mu.Lock()
+	if j.stageCache == nil {
+		j.stageCache = map[string][]byte{}
+	}
+	j.stageCache[url] = data
+	j.mu.Unlock()
+}
+
+// stagedAsset returns the staged bytes for url and whether the URL is
+// present in the cache. Guarded by j.mu.
+func (j *Job) stagedAsset(url string) ([]byte, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	data, ok := j.stageCache[url]
+	return data, ok
 }
 
 // ─── API handlers ─────────────────────────────────────────────
@@ -470,6 +502,14 @@ type deployRequest struct {
 	DevSplit int    `json:"devSplit"` // advanced: % to dev fund (0-50, default 10)
 	Margin   int    `json:"margin"`   // advanced: operator markup % (0-100, default 0)
 	Mint     string `json:"mint"`     // advanced: preferred Cashu mint URL
+	// PreStage asks the wizard to download all deploy binaries up-front into
+	// the Job's stageCache before running the flash/install steps, so the
+	// deploy can proceed even if the laptop's internet path dies mid-deploy
+	// (e.g. a STA-mode laptop whose only uplink is the router being flashed).
+	// This is a per-request FLAG ONLY — the cache itself lives on the Job
+	// struct (guarded by j.mu), NOT here (deployRequest is per-POST and
+	// synchronous).
+	PreStage bool `json:"preStage"`
 }
 
 func handleDeploy(w http.ResponseWriter, r *http.Request) {
