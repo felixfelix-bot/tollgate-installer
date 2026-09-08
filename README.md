@@ -164,6 +164,40 @@ The tollgate-wrt `.ipk`/`.apk` ships the captive portal
 nftables enforcement rules — the wizard only installs the package and points
 nodogsplash/uhttpd at it.
 
+### Pre-download (staging) + on-disk re-deploy cache
+
+The wizard has an optional **PreStage** phase (checkbox in the deploy UI —
+"Pre-download required packages before deploy"): before running the
+flash/install steps it downloads the OpenWrt sysupgrade image (for stock
+GL.iNet routers being flashed) and the tollgate-wrt package into an in-memory
+cache, so the actual deploy runs entirely offline from the laptop's
+perspective. This matters when the laptop's only internet path is *via* the
+router being flashed/reconfigured (STA/repeater mode).
+
+Staged binaries are also persisted to an **on-disk cache** so a second deploy
+to a different router re-uses them instead of re-downloading:
+
+| | |
+|---|---|
+| **Location** | `~/.tollgate-stage/` (`$HOME/.tollgate-stage`) |
+| **File name** | hex `sha256` of the asset URL |
+| **What is persisted** | ONLY the version-pinned OpenWrt flash image (consultant RISK 3). Package binaries (.ipk/.apk, nodogsplash, jq) are **never** written to the disk cache — they can change between releases, and a stale cached copy could shadow a newer package. |
+| **Invalidation** | None needed — see note below. |
+
+**Clearing the cache:** delete the directory — it is always safe to remove;
+the wizard re-stages the flash image on the next deploy:
+
+```sh
+rm -rf ~/.tollgate-stage
+```
+
+The installer never writes outside `~/.tollgate-stage`. TTL/invalidation is
+deliberately minimal: because only the version-pinned flash image is
+persisted, a cache entry is either correct (exact image for that pinned
+release) or superseded when the plan bumps `openWrtVersion` — at which point
+the image URL changes, the sha256 filename changes, and the old entry is
+simply orphaned (harmless, remove with `rm -rf` above).
+
 ## Build from source
 
 ```sh
