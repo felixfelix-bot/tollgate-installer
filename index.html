@@ -133,8 +133,8 @@
 <body>
 <div class="container">
   <div class="logo">
-    <h1>net<span>4sats</span></h1>
-    <p>Bitcoin WiFi — Setup your router in 60 seconds</p>
+    <h1>TollGate</h1>
+    <p>Setup your router in 60 seconds</p>
   </div>
 
   <!-- Scan View -->
@@ -403,7 +403,9 @@ function showSelectView() {
   const select = document.getElementById('router-select');
   select.innerHTML = '';
   detectedRouters.forEach(r => {
-    const label = r.ip + ' \u2014 ' + r.vendor + ' ' + r.model;
+    let name = (r.vendor + ' ' + r.model).trim();
+    if (name === 'unknown unknown' || name === '') name = 'Router';
+    const label = name + ' (' + r.ip + ')';
     const opt = document.createElement('option');
     opt.value = r.ip;
     opt.textContent = label;
