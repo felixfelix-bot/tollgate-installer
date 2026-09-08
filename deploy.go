@@ -134,19 +134,20 @@ func runDeployment(job *Job, req deployRequest) {
 			return
 		}
 
-		// Download the image on the laptop (not the router — limited storage).
-		// USE downloadWithRetry (3 attempts, exponential backoff) — transient
-		// network errors and 5xx are retried; a definitive 4xx (bad image pin)
-		// fails immediately. Raw http.Get is NOT used (no timeout/redirect/size
-		// handling).
+		// Obtain the image on the laptop (not the router — limited storage).
+		// USE the staging cache first: when the PreStage step pre-downloaded
+		// this exact image URL, flashImageBytes serves the staged bytes with
+		// zero network (the offline case staging exists for). On a cache miss
+		// it downloads live via downloadWithRetry (3 attempts, exponential
+		// backoff) — transient network errors and 5xx are retried; a definitive
+		// 4xx (bad image pin) fails immediately. Raw http.Get is NOT used (no
+		// timeout/redirect/size handling).
 		imageURL := img.URL()
-		job.addLog("Downloading: " + imageURL)
-		imageData, err := downloadWithRetry(imageURL, 3, 2*time.Second)
+		imageData, err := flashImageBytes(job, imageURL)
 		if err != nil {
 			jobFail(job, 2, "Download failed after 3 attempts: "+err.Error(), "Failed to download OpenWrt image after 3 attempts: "+err.Error()+"\nURL: "+imageURL)
 			return
 		}
-		job.addLog(fmt.Sprintf("Downloaded %d KB", len(imageData)/1024))
 
 		// Push the image to the router via the SSH stdin pipe.
 		// USE sshUploadPipe (ssh.go:74) — same pattern as the package-install
@@ -275,21 +276,29 @@ func runDeployment(job *Job, req deployRequest) {
 	// Sync from the laptop clock before any router-side download attempt.
 	sshRun(client, "date -s @"+strconv.FormatInt(time.Now().Unix(), 10)+" >/dev/null 2>&1; true")
 
-	// PRIMARY: download the package on the LAPTOP and push it over SSH stdin.
-	// This eliminates the router's DNS/TLS stack from the critical path —
-	// a freshly STA-connected router often has no working DNS yet.
-	job.addLog("Downloading tollgate-wrt v0.7.0-alpha10 " + pkgExtension + " (laptop-side)...")
+	// PRIMARY: prefer the tollgate-wrt bytes the PreStage step cached for this
+	// exact URL — the point of staging is that the actual install performs zero
+	// network fetches. On a cache miss, download the package on the LAPTOP and
+	// push it over SSH stdin. Pushing eliminates the router's DNS/TLS stack
+	// from the critical path — a freshly STA-connected router often has no
+	// working DNS yet. A live-fetch failure falls through to the router-side
+	// wget (and then feed) paths below.
 	pkgOnRouter := false
-	if data, err := httpGetFile(selectedPkgURL); err == nil && len(data) > 0 {
-		push := sshUploadPipe(client, data, "cat > /tmp/tollgate-wrt"+pkgExtension+" && echo PUSH_OK")
+	pkgData, pkgFromCache, pkgErr := stagedOrLiveBytes(job, "tollgate-wrt "+pkgExtension, selectedPkgURL)
+	if pkgErr == nil && len(pkgData) > 0 {
+		push := sshUploadPipe(client, pkgData, "cat > /tmp/tollgate-wrt"+pkgExtension+" && echo PUSH_OK")
 		if strings.Contains(push, "PUSH_OK") {
 			pkgOnRouter = true
-			job.addLog(fmt.Sprintf("Package downloaded on laptop (%d KB), pushed to router via SSH", len(data)/1024))
+			if pkgFromCache {
+				job.addLog(fmt.Sprintf("Staged tollgate-wrt %s used from cache (%d KB), pushed to router via SSH", pkgExtension, len(pkgData)/1024))
+			} else {
+				job.addLog(fmt.Sprintf("Package downloaded on laptop (%d KB), pushed to router via SSH", len(pkgData)/1024))
+			}
 		} else {
 			job.addLog("SSH push failed: " + truncate(push, 80))
 		}
-	} else if err != nil {
-		job.addLog("Laptop download failed: " + truncate(err.Error(), 80) + " — falling back to router-side wget")
+	} else if pkgErr != nil {
+		job.addLog("Laptop download failed: " + truncate(pkgErr.Error(), 80) + " — falling back to router-side wget")
 	}
 
 	// FALLBACK: router-side wget, with a real DNS probe and wget's stderr
@@ -334,20 +343,28 @@ func runDeployment(job *Job, req deployRequest) {
 				ndsPkg := extractIPKFilename(ndsListHTML, "nodogsplash")
 				jqPkg := extractIPKFilename(jqListHTML, "jq")
 				if ndsPkg != "" {
-					ndsData, ndsErr := httpGetFile(routingURL + ndsPkg)
+					ndsData, ndsFromCache, ndsErr := stagedOrLiveBytes(job, "nodogsplash .ipk", routingURL+ndsPkg)
 					if ndsErr == nil && len(ndsData) > 1000 {
 						pushNds := sshUploadPipe(client, ndsData, "cat > /tmp/"+ndsPkg+" && echo NDS_PUSHED")
 						if strings.Contains(pushNds, "NDS_PUSHED") {
-							job.addLog(fmt.Sprintf("nodogsplash .ipk downloaded (%d KB), pushed to router", len(ndsData)/1024))
+							if ndsFromCache {
+								job.addLog(fmt.Sprintf("nodogsplash .ipk used from staging cache (%d KB), pushed to router", len(ndsData)/1024))
+							} else {
+								job.addLog(fmt.Sprintf("nodogsplash .ipk downloaded (%d KB), pushed to router", len(ndsData)/1024))
+							}
 						}
 					}
 				}
 				if jqPkg != "" {
-					jqData, jqErr := httpGetFile(packagesURL + jqPkg)
+					jqData, jqFromCache, jqErr := stagedOrLiveBytes(job, "jq .ipk", packagesURL+jqPkg)
 					if jqErr == nil && len(jqData) > 1000 {
 						pushJq := sshUploadPipe(client, jqData, "cat > /tmp/"+jqPkg+" && echo JQ_PUSHED")
 						if strings.Contains(pushJq, "JQ_PUSHED") {
-							job.addLog(fmt.Sprintf("jq .ipk downloaded (%d KB), pushed to router", len(jqData)/1024))
+							if jqFromCache {
+								job.addLog(fmt.Sprintf("jq .ipk used from staging cache (%d KB), pushed to router", len(jqData)/1024))
+							} else {
+								job.addLog(fmt.Sprintf("jq .ipk downloaded (%d KB), pushed to router", len(jqData)/1024))
+							}
 						}
 					}
 				}
@@ -1166,6 +1183,28 @@ func stageAssets(job *Job, urls []string) []string {
 		}
 	}
 	return failed
+}
+
+// stagedOrLiveBytes returns the bytes for a small deploy asset — the
+// tollgate-wrt package (.ipk/.apk), nodogsplash .ipk, or jq .ipk — keyed by
+// the EXACT source URL. When the PreStage step cached that URL the bytes are
+// served with zero network (the offline-install case staging exists for). On a
+// cache miss the asset is fetched live with httpGetFile — packages are small,
+// single downloads, so they intentionally do NOT use the heavier
+// downloadWithRetry path (that is reserved for the flash image, see
+// flashImageBytes in images.go); a live failure here is what triggers the
+// install step's router-side wget → feed fallback chain. The second return
+// reports whether the bytes came from the cache so callers can log the actual
+// acquisition path. A "Downloading ..." log is emitted before any live fetch
+// so the operator sees progress during the (up to 60s) download.
+func stagedOrLiveBytes(job *Job, label, url string) ([]byte, bool, error) {
+	if data, ok := job.stagedAsset(url); ok {
+		job.addLog("Using staged " + label + " from cache (no download)")
+		return data, true, nil
+	}
+	job.addLog("Downloading " + label + " (laptop-side)...")
+	data, err := httpGetFile(url)
+	return data, false, err
 }
 
 // ---- On-disk re-deploy cache (~/.tollgate-stage) ----
