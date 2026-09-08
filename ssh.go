@@ -1,0 +1,132 @@
+package main
+
+import (
+	"bytes"
+	"net"
+	"os"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// sshConnect establishes an SSH session to the router.
+//
+// Auth chain, tried in order (a fresh-reset OpenWrt router ships root with
+// an EMPTY password, while an already-configured one has the operator's
+// password — the wizard must handle both):
+//  1. Password(user-supplied)  — configured routers (v0.5.0 back-compat)
+//  2. Password("")             — fresh routers, password auth
+//  3. KeyboardInteractive      — fresh routers whose dropbear only accepts
+//     (answers = password)       keyboard-interactive for the empty password
+//  4. Default SSH keys          — key-provisioned routers, if present
+func sshConnect(ip, password string) *ssh.Client {
+	config := &ssh.ClientConfig{
+		User:            "root",
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	}
+
+	auth := []ssh.AuthMethod{}
+	if password != "" {
+		auth = append(auth, ssh.Password(password))
+	}
+	auth = append(auth,
+		ssh.Password(""),
+		keyboardInteractiveAuth(password),
+	)
+	if signer := tryDefaultKeys(); signer != nil {
+		auth = append(auth, ssh.PublicKeys(signer))
+	}
+	config.Auth = auth
+
+	client, err := ssh.Dial("tcp", net.JoinHostPort(ip, "22"), config)
+	if err != nil {
+		return nil
+	}
+	return client
+}
+
+// keyboardInteractiveAuth answers every keyboard-interactive challenge with
+// the given password ("" for a fresh router). The callback MUST return
+// exactly one answer per question or x/crypto/ssh fails the auth attempt.
+func keyboardInteractiveAuth(password string) ssh.AuthMethod {
+	return ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+		answers := make([]string, len(questions))
+		for i := range answers {
+			answers[i] = password
+		}
+		return answers, nil
+	})
+}
+
+// sshRun executes a command and returns combined output.
+func sshRun(client *ssh.Client, cmd string) string {
+	session, err := client.NewSession()
+	if err != nil {
+		return ""
+	}
+	defer session.Close()
+	output, err := session.CombinedOutput(cmd)
+	return string(output)
+}
+
+// sshUploadPipe writes binary data to the router via SSH stdin.
+func sshUploadPipe(client *ssh.Client, data []byte, extractCmd string) string {
+	session, err := client.NewSession()
+	if err != nil {
+		return ""
+	}
+	defer session.Close()
+	session.Stdin = bytes.NewReader(data)
+	output, err := session.CombinedOutput(extractCmd)
+	return string(output)
+}
+
+// sshWriteFile writes content to a remote path via SSH (cat > path).
+func sshWriteFile(client *ssh.Client, remotePath string, content []byte) error {
+	session, err := client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := session.Start("cat > " + remotePath); err != nil {
+		return err
+	}
+
+	_, err = stdin.Write(content)
+	if err != nil {
+		return err
+	}
+	stdin.Close()
+
+	return session.Wait()
+}
+
+// tryDefaultKeys attempts to load the default SSH key.
+func tryDefaultKeys() ssh.Signer {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	for _, p := range []string{
+		home + "/.ssh/id_ed25519",
+		home + "/.ssh/id_rsa",
+		home + "/.ssh/id_ecdsa",
+	} {
+		key, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err == nil {
+			return signer
+		}
+	}
+	return nil
+}
