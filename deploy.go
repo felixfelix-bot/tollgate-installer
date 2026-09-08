@@ -138,23 +138,12 @@ func runDeployment(job *Job, req deployRequest) {
 		job.addLog("sysupgrade: " + truncate(upgradeOut, 200))
 
 		// Wait for the router to reboot. Stock GL.iNet uses 192.168.8.1,
-		// OpenWrt defaults to 192.168.1.1.
-		job.addLog("Router rebooting. Waiting for it to come back...")
-		time.Sleep(120 * time.Second)
-
-		// Reconnect to the new OpenWrt IP.
-		// CRITICAL: after `sysupgrade -n` the fresh OpenWrt root password is
-		// EMPTY — req.Password will fail. USE reconnectSSH (deploy.go:598)
-		// which retries AND falls back to empty-password auth.
-		newIP := req.IP
-		newClient := reconnectSSH(req.IP, req.Password, 3, 2*time.Second)
-		if newClient == nil && req.IP != "192.168.1.1" {
-			newClient = reconnectSSH("192.168.1.1", req.Password, 3, 2*time.Second)
-			if newClient != nil {
-				newIP = "192.168.1.1"
-			}
-		}
-		if newClient == nil {
+		// OpenWrt defaults to 192.168.1.1. Poll with tcpProbe + reconnectSSH
+		// (which retries AND falls back to empty-password auth for the fresh
+		// OpenWrt root) until the router comes back on OpenWrt, up to 3min.
+		job.addLog("Router rebooting. Waiting for it to come back (up to 3 min)...")
+		newIP, newClient, err := waitForRouterAfterFlash(req.IP, req.Password, 3*time.Minute)
+		if err != nil {
 			jobFail(job, 1, "Router unreachable after flash", "Router did not come back after flash. Last known IP: "+req.IP+". See manual recovery docs (GL.iNet recovery mode).")
 			return
 		}
@@ -694,6 +683,50 @@ func reconnectSSH(ip, password string, attempts int, delay time.Duration) *ssh.C
 		}
 	}
 	return nil
+}
+
+// waitForRouterAfterFlash polls for the router to come back after sysupgrade.
+// After `sysupgrade -n` the router reboots onto a fresh OpenWrt install whose
+// root password is EMPTY, so each candidate IP is probed with tcpProbe and then
+// connected via reconnectSSH (which retries AND falls back to empty-password
+// auth). The connection is only accepted once it verifies the OpenWrt banner,
+// so a stock GL.iNet still mid-reboot is not mistaken for the new install.
+// Returns the new IP and a live SSH client, or an error on timeout.
+func waitForRouterAfterFlash(originalIP, password string, timeout time.Duration) (string, *ssh.Client, error) {
+	deadline := time.Now().Add(timeout)
+	// Candidate IPs: the original (stock GL may keep it), the OpenWrt default,
+	// and the stock GL default. Dedupe against the original.
+	candidates := []string{originalIP}
+	for _, ip := range []string{"192.168.1.1", "192.168.8.1"} {
+		if ip != originalIP {
+			candidates = append(candidates, ip)
+		}
+	}
+
+	for time.Now().Before(deadline) {
+		for _, ip := range candidates {
+			if !tcpProbe(ip, 22, 500*time.Millisecond) {
+				continue
+			}
+			// Port 22 is open — try to connect. reconnectSSH retries and
+			// falls back to empty-password auth for the fresh OpenWrt root.
+			client := reconnectSSH(ip, password, 2, 1*time.Second)
+			if client == nil {
+				continue
+			}
+			// Verify it's actually OpenWrt (not stock GL still booting).
+			out := sshRun(client, "cat /etc/openwrt_release 2>/dev/null | head -1")
+			if strings.Contains(out, "OpenWrt") {
+				return ip, client, nil
+			}
+			client.Close()
+		}
+		// Only pause between polls if we still have time left.
+		if time.Now().Before(deadline) {
+			time.Sleep(5 * time.Second)
+		}
+	}
+	return "", nil, fmt.Errorf("router did not come back within %v", timeout)
 }
 
 // ifaceUp parses `ubus call network.interface.<name> status` output and
