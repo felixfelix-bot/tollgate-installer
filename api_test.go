@@ -130,7 +130,7 @@ func TestStepInitialization(t *testing.T) {
 		t.Error("deploySteps should not return empty steps")
 	}
 
-	expectedSteps := []string{"verify", "firmware", "password", "upstream", "install", "brand", "portal", "lnurl", "services", "health"}
+	expectedSteps := []string{"verify", "flash", "firmware", "password", "upstream", "install", "brand", "portal", "lnurl", "services", "health"}
 	for i, expected := range expectedSteps {
 		if i >= len(steps) {
 			t.Errorf("missing step %d: %s", i, expected)

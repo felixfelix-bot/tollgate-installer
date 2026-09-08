@@ -42,8 +42,8 @@ func validLightningAddress(s string) bool {
 }
 
 var (
-	listenPort  = flag.String("port", "8099", "HTTP listen port")
-	listenAddr  string
+	listenPort = flag.String("port", "8099", "HTTP listen port")
+	listenAddr string
 )
 
 // ─── Job tracking ─────────────────────────────────────────────
