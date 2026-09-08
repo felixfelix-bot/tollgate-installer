@@ -146,9 +146,11 @@ func TestMainFunctionStructure(t *testing.T) {
 	// Test that the main function sets up routes correctly
 	// This is a basic structural test since we can't easily run the main function
 
-	// Check that listenAddr is properly set
-	if listenAddr != ":8099" {
-		t.Errorf("listenAddr = %q, want %q", listenAddr, ":8099")
+	// The default HTTP listen port is the contract the wizard binds to.
+	// listenAddr itself is only assigned inside main() (which never runs in
+	// tests), so assert the default flag value that main() derives it from.
+	if *listenPort != "8099" {
+		t.Errorf("default listenPort = %q, want %q", *listenPort, "8099")
 	}
 
 	// Verify the regex patterns are compiled
