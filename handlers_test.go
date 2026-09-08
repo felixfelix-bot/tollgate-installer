@@ -146,9 +146,12 @@ func TestMainFunctionStructure(t *testing.T) {
 	// Test that the main function sets up routes correctly
 	// This is a basic structural test since we can't easily run the main function
 
-	// Check that listenAddr is properly set
-	if listenAddr != ":8099" {
-		t.Errorf("listenAddr = %q, want %q", listenAddr, ":8099")
+	// Check that the default listen port is properly set. listenAddr itself is
+	// only assigned inside main() (":8099" from the flag default), so it is
+	// always "" in a test binary — assert the flag default, the real source of
+	// truth for the listen address.
+	if *listenPort != "8099" {
+		t.Errorf("listenPort default = %q, want %q", *listenPort, "8099")
 	}
 
 	// Verify the regex patterns are compiled
