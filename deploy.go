@@ -111,14 +111,15 @@ func runDeployment(job *Job, req deployRequest) {
 		}
 
 		// Download the image on the laptop (not the router — limited storage).
-		// USE httpGetFile (deploy.go:756) — the codebase's established download
-		// helper with 60s timeout, redirect following, and a 64MB LimitReader
-		// guard. Raw http.Get is NOT used (no timeout/redirect/size handling).
+		// USE downloadWithRetry (3 attempts, exponential backoff) — transient
+		// network errors and 5xx are retried; a definitive 4xx (bad image pin)
+		// fails immediately. Raw http.Get is NOT used (no timeout/redirect/size
+		// handling).
 		imageURL := img.URL()
 		job.addLog("Downloading: " + imageURL)
-		imageData, err := httpGetFile(imageURL)
+		imageData, err := downloadWithRetry(imageURL, 3, 2*time.Second)
 		if err != nil {
-			jobFail(job, 1, "Download failed: "+err.Error(), "Failed to download OpenWrt image: "+err.Error())
+			jobFail(job, 1, "Download failed after 3 attempts: "+err.Error(), "Failed to download OpenWrt image after 3 attempts: "+err.Error()+"\nURL: "+imageURL)
 			return
 		}
 		job.addLog(fmt.Sprintf("Downloaded %d KB", len(imageData)/1024))
@@ -128,7 +129,11 @@ func runDeployment(job *Job, req deployRequest) {
 		// step (deploy.go:157). A function called "sshWrite" does NOT exist.
 		pushOut := sshUploadPipe(client, imageData, "cat > /tmp/openwrt-sysupgrade.bin && echo PUSH_OK")
 		if !strings.Contains(pushOut, "PUSH_OK") {
-			jobFail(job, 1, "Image push failed", "Failed to push OpenWrt image to router: "+truncate(pushOut, 80))
+			// Push failed — check router storage space so the operator knows
+			// whether it's a full /tmp (common on small-flash GL.iNet boards)
+			// vs a network/SSH problem.
+			dfOut := sshRun(client, "df -h /tmp 2>&1")
+			jobFail(job, 1, "Image push failed", "Failed to push OpenWrt image to router: "+truncate(pushOut, 80)+"\nRouter /tmp storage:\n"+truncate(dfOut, 200)+"\nIf /tmp is full, free space (remove old images) and retry, or flash manually via GL.iNet recovery mode.")
 			return
 		}
 		job.addLog("Image pushed to router")
@@ -136,6 +141,14 @@ func runDeployment(job *Job, req deployRequest) {
 		// Run sysupgrade. The router will go down and reboot onto OpenWrt.
 		upgradeOut := sshRun(client, "sysupgrade -n /tmp/openwrt-sysupgrade.bin 2>&1")
 		job.addLog("sysupgrade: " + truncate(upgradeOut, 200))
+		// If sysupgrade returned a recognizable error (image rejected, no
+		// space, missing binary), surface it immediately instead of waiting
+		// 3 minutes for a router that never reboots.
+		if strings.Contains(upgradeOut, "failed") || strings.Contains(upgradeOut, "error") ||
+			strings.Contains(upgradeOut, "not found") || strings.Contains(upgradeOut, "invalid") {
+			jobFail(job, 1, "sysupgrade failed", parseSysupgradeError(upgradeOut))
+			return
+		}
 
 		// Wait for the router to reboot. Stock GL.iNet uses 192.168.8.1,
 		// OpenWrt defaults to 192.168.1.1. Poll with tcpProbe + reconnectSSH
@@ -143,6 +156,20 @@ func runDeployment(job *Job, req deployRequest) {
 		// OpenWrt root) until the router comes back on OpenWrt, up to 3min.
 		job.addLog("Router rebooting. Waiting for it to come back (up to 3 min)...")
 		newIP, newClient, err := waitForRouterAfterFlash(req.IP, req.Password, 3*time.Minute)
+		if err != nil {
+			// Last-resort fallback: the router may have come back on an
+			// unexpected IP (LAN bridge changed the subnet). Scan the /24
+			// subnet for any host presenting the OpenWrt banner.
+			job.addLog("Router not found on expected IPs. Scanning LAN subnet for OpenWrt...")
+			scannedIP := scanSubnetForOpenWrt(req.IP, req.Password, 60*time.Second)
+			if scannedIP != "" {
+				newClient = reconnectSSH(scannedIP, req.Password, 3, 2*time.Second)
+				if newClient != nil {
+					newIP = scannedIP
+					err = nil
+				}
+			}
+		}
 		if err != nil {
 			jobFail(job, 1, "Router unreachable after flash", "Router did not come back after flash. Last known IP: "+req.IP+". See manual recovery docs (GL.iNet recovery mode).")
 			return
@@ -729,6 +756,36 @@ func waitForRouterAfterFlash(originalIP, password string, timeout time.Duration)
 	return "", nil, fmt.Errorf("router did not come back within %v", timeout)
 }
 
+// scanSubnetForOpenWrt scans the /24 subnet containing baseIP for a host with
+// port 22 open that presents the OpenWrt banner. It is the last-resort fallback
+// when the router comes back on an unexpected IP (e.g. the LAN bridge changed
+// the subnet). Returns the first matching IP, or "" if none found.
+func scanSubnetForOpenWrt(baseIP, password string, timeout time.Duration) string {
+	// Derive the /24 prefix from baseIP (e.g. 192.168.1.5 -> 192.168.1).
+	parts := strings.Split(baseIP, ".")
+	if len(parts) != 4 {
+		return ""
+	}
+	prefix := parts[0] + "." + parts[1] + "." + parts[2] + "."
+	deadline := time.Now().Add(timeout)
+	for i := 1; i <= 254 && time.Now().Before(deadline); i++ {
+		ip := prefix + strconv.Itoa(i)
+		if !tcpProbe(ip, 22, 300*time.Millisecond) {
+			continue
+		}
+		client := reconnectSSH(ip, password, 1, 500*time.Millisecond)
+		if client == nil {
+			continue
+		}
+		out := sshRun(client, "cat /etc/openwrt_release 2>/dev/null | head -1")
+		client.Close()
+		if strings.Contains(out, "OpenWrt") {
+			return ip
+		}
+	}
+	return ""
+}
+
 // ifaceUp parses `ubus call network.interface.<name> status` output and
 // reports whether the interface is up. This is the only reliable STA
 // verification: grepping iwinfo never matches (kernel interface names are
@@ -884,6 +941,84 @@ func httpGetFile(url string) ([]byte, error) {
 		return nil, fmt.Errorf("HTTP %s", resp.Status)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+}
+
+// downloadWithRetry downloads url with up to `attempts` tries, backing off
+// exponentially (baseDelay * 2^attempt) between failures. Transient network
+// errors and HTTP 5xx responses are retried; a definitive 4xx (e.g. 404 for a
+// bad image pin) is NOT retried — retrying a 404 wastes time and masks a
+// broken URL. Returns the first non-retryable error or the last error.
+func downloadWithRetry(url string, attempts int, baseDelay time.Duration) ([]byte, error) {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		data, err := httpGetFile(url)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		// Do not retry definitive client errors (404, 403, 410, etc.) — the
+		// URL is broken and retrying will not fix it.
+		if isDefinitiveHTTPError(err) {
+			return nil, err
+		}
+		if i < attempts-1 {
+			time.Sleep(baseDelay * time.Duration(1<<i))
+		}
+	}
+	return nil, lastErr
+}
+
+// isDefinitiveHTTPError reports whether err is a non-retryable HTTP client
+// error (4xx). Network errors and 5xx are transient and retryable.
+func isDefinitiveHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// httpGetFile returns errors of the form "HTTP 404 Not Found".
+	if !strings.HasPrefix(msg, "HTTP ") {
+		return false
+	}
+	// Extract the status code.
+	rest := strings.TrimPrefix(msg, "HTTP ")
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return false
+	}
+	code, convErr := strconv.Atoi(fields[0])
+	if convErr != nil {
+		return false
+	}
+	return code >= 400 && code < 500
+}
+
+// parseSysupgradeError inspects sysupgrade output for common failure modes and
+// returns a human-readable, actionable message. Unknown output falls back to a
+// generic message with the raw output truncated.
+func parseSysupgradeError(out string) string {
+	low := strings.ToLower(out)
+	switch {
+	case strings.Contains(low, "image check failed"),
+		strings.Contains(low, "invalid image"),
+		strings.Contains(low, "wrong image"),
+		strings.Contains(low, "unsupported image"),
+		strings.Contains(low, "not a valid sysupgrade"):
+		return "sysupgrade rejected the image (incompatible or corrupt). Re-download and retry, or flash manually via GL.iNet recovery mode."
+	case strings.Contains(low, "no space left"),
+		strings.Contains(low, "not enough space"),
+		strings.Contains(low, "insufficient space"),
+		strings.Contains(low, "cannot allocate"):
+		return "Router storage is full. Free space on /tmp (e.g. remove old images) and retry, or flash manually."
+	case strings.Contains(low, "command not found"),
+		strings.Contains(low, "sysupgrade: not found"):
+		return "sysupgrade is not available on this firmware — it is not a standard OpenWrt install. Flash manually via GL.iNet recovery mode."
+	case strings.Contains(low, "connection refused"),
+		strings.Contains(low, "connection reset"),
+		strings.Contains(low, "broken pipe"):
+		return "SSH connection dropped during sysupgrade (expected — the router reboots). Waiting for it to come back."
+	default:
+		return "sysupgrade output: " + truncate(out, 200)
+	}
 }
 
 // httpGetFileOrEmpty is like httpGetFile but returns an empty slice on error
