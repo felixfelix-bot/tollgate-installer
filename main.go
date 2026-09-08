@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -40,7 +41,10 @@ func validLightningAddress(s string) bool {
 	return lnAddrRe.MatchString(s) || lnurlRe.MatchString(s)
 }
 
-const listenAddr = ":8099"
+var (
+	listenPort  = flag.String("port", "8099", "HTTP listen port")
+	listenAddr  string
+)
 
 // ─── Job tracking ─────────────────────────────────────────────
 
@@ -573,6 +577,8 @@ func allRadiosUp(statusJSON string) bool {
 }
 
 func main() {
+	flag.Parse()
+	listenAddr = ":" + *listenPort
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/scan", handleScan)
 	mux.HandleFunc("/api/wifi-scan", handleWifiScan)
