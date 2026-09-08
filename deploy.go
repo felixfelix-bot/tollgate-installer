@@ -2,10 +2,14 @@ package main
 
 import (
 	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1128,14 +1132,135 @@ func stageAssets(job *Job, urls []string) []string {
 		if _, ok := job.stagedAsset(u); ok {
 			continue
 		}
+		// Disk re-deploy cache (Task 5): if a previous deploy to another
+		// router already staged this URL, load the persisted bytes instead of
+		// downloading again. Only version-pinned assets are eligible (see
+		// persistableDiskAsset) — a package binary is never loaded from disk,
+		// so a stale cached package can never shadow a newer release.
+		if persistableDiskAsset(u) {
+			if data, ok := loadStageDisk(u); ok {
+				job.addLog("PreStage: using disk cache for " + truncate(u, 100) + " (no download)")
+				job.stageAsset(u, data)
+				continue
+			}
+		}
 		data, err := downloadWithRetry(u, 3, 2*time.Second)
 		if err != nil || len(data) == 0 {
 			failed = append(failed, u)
 			continue
 		}
 		job.stageAsset(u, data)
+		// Write through to the disk cache so a later deploy to another router
+		// re-uses these bytes. Non-fatal: a read-only HOME or full disk must
+		// not fail the deploy — the live-fetch fallback remains for next time.
+		if persistableDiskAsset(u) {
+			if err := saveStageDisk(u, data); err != nil {
+				job.addLog("PreStage: could not persist " + truncate(u, 100) + " to disk cache: " + err.Error())
+			}
+		}
 	}
 	return failed
+}
+
+// ---- On-disk re-deploy cache (~/.tollgate-stage) ----
+//
+// The Job stageCache is in-memory and per-Job, so a second deploy to a
+// different router (a fresh Job) would re-download every asset. Task 5 adds a
+// small on-disk cache so re-deploys re-use previously staged binaries.
+//
+// RISK 3 (consultant): ONLY the version-pinned flash image is persisted.
+// Package binaries (tollgate-wrt .ipk/.apk, nodogsplash, jq) can change
+// between releases — a stale cached copy would shadow the newer package and
+// could install an outdated backend. The flash image URL is pinned to a fixed
+// OpenWrt release (openWrtVersion), so its bytes are stable by construction.
+
+// stageDiskDirOverride redirects the on-disk staging cache directory.
+// Non-empty in tests to keep the real home directory untouched.
+var stageDiskDirOverride = ""
+
+// stageDiskDir returns the on-disk staging cache directory: ~/.tollgate-stage
+// (or stageDiskDirOverride, set by tests to keep the real home directory
+// untouched). Empty when no home dir exists — callers then skip disk
+// persistence (in-memory cache + live fallback only).
+func stageDiskDir() string {
+	if stageDiskDirOverride != "" {
+		return stageDiskDirOverride
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".tollgate-stage")
+}
+
+// stageDiskPath returns the on-disk cache file path for an asset URL:
+// <cacheDir>/<hex sha256 of url>. Addressing by URL keeps one file per asset
+// across deploys and makes corruption detectable by size (see loadStageDisk);
+// a changed URL (new release) naturally misses and re-downloads.
+func stageDiskPath(url string) string {
+	sum := sha256.Sum256([]byte(url))
+	return filepath.Join(stageDiskDir(), hex.EncodeToString(sum[:]))
+}
+
+// persistableDiskAsset reports whether an asset URL may be written to / read
+// from the on-disk re-deploy cache. Default policy: ONLY version-pinned flash
+// images from glModelMap qualify — package binaries are never persisted
+// (consultant RISK 3, staging plan 2026-09-08). Var so tests can pin the
+// policy to a local httptest URL without network access.
+var persistableDiskAsset = func(url string) bool {
+	for _, img := range glModelMap {
+		if img.URL() == url {
+			return true
+		}
+	}
+	return false
+}
+
+// loadStageDisk returns the persisted bytes for url from the on-disk staging
+// cache. ok=false on any miss or when the file is empty/corrupt (size 0) —
+// the caller then falls back to a live download.
+func loadStageDisk(url string) ([]byte, bool) {
+	if stageDiskDir() == "" {
+		return nil, false
+	}
+	path := stageDiskPath(url)
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+	return data, true
+}
+
+// saveStageDisk persists data for url to the on-disk staging cache, creating
+// the cache directory if needed. The write is atomic (temp file + rename) so
+// a crash mid-write can never leave a truncated file that a later deploy
+// would trust as a complete image.
+func saveStageDisk(url string, data []byte) error {
+	if stageDiskDir() == "" || len(data) == 0 {
+		return nil
+	}
+	path := stageDiskPath(url)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".stage-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // extractIPKFilename scans an OpenWrt package directory listing (HTML) and
