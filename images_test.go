@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestOpenWrtImageURLFormat verifies the URL() method produces the standard
@@ -112,5 +115,47 @@ func TestGlModelMapUniqueBoards(t *testing.T) {
 			t.Errorf("models %q and %q both map to %q", prev, model, key)
 		}
 		seen[key] = model
+	}
+}
+
+// TestGlModelMapURLsAreLive is the liveness regression test for the OpenWrt
+// sysupgrade image URLs built by glModelMap. Every model the wizard can flash
+// must resolve to a real image on downloads.openwrt.org today — a 404 here
+// means a fresh GL.iNet flash breaks at the download step.
+//
+// It performs real HTTP requests (Range: bytes=0-0 so image bodies are not
+// downloaded). Run with -short to skip network access for offline hacking;
+// the CI-parity command is plain `go test ./...`, which runs this live.
+//
+// NOTE: images.go declares NO *URL constants (URLs are built via the URL()
+// method), so these are intentionally NOT registered in pins_test.go's
+// expectedPinnedURLConsts/liveCheckPins — that registry parses only deploy.go.
+// This test is the dedicated liveness guard for the image map.
+func TestGlModelMapURLsAreLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live URL check skipped: -short mode (CI-parity runs without -short)")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	for model, img := range glModelMap {
+		url := img.URL()
+		t.Run(model, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, url, nil)
+			if err != nil {
+				t.Fatalf("building request for %s: %v", model, err)
+			}
+			req.Header.Set("Range", "bytes=0-0") // fetch 1 byte, not the image
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s = %q: request failed: %v", model, url, err)
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+
+			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+				t.Errorf("%s = %q: got HTTP %d, want 200 — broken image pin, GL.iNet flash will fail",
+					model, url, resp.StatusCode)
+			}
+		})
 	}
 }
