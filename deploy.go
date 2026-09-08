@@ -33,6 +33,7 @@ const (
 func deploySteps() []Step {
 	return []Step{
 		{Name: "verify", Desc: "Verifying SSH access to router...", Status: "pending"},
+		{Name: "flash", Desc: "Flashing OpenWrt on stock GL.iNet...", Status: "pending"},
 		{Name: "firmware", Desc: "Checking firmware version...", Status: "pending"},
 		{Name: "password", Desc: "Setting root password...", Status: "pending"},
 		{Name: "upstream", Desc: "Configuring upstream connection...", Status: "pending"},
@@ -68,20 +69,106 @@ func runDeployment(job *Job, req deployRequest) {
 	job.setStep(0, "running", "")
 	fwOut := sshRun(client, "cat /etc/openwrt_release 2>/dev/null || cat /etc/openwrt_version 2>/dev/null || echo 'not openwrt'")
 	fwOut = strings.TrimSpace(fwOut)
+	isStockGL := false
+	var glModel string
 	if fwOut == "not openwrt" || fwOut == "" {
-		job.setStep(0, "failed", "Router is not running OpenWrt")
-		job.mu.Lock()
-		job.Status = "failed"
-		job.Error = "Router is not running OpenWrt firmware"
-		job.mu.Unlock()
-		return
+		// Not OpenWrt — check for stock GL.iNet firmware. If present, we
+		// proceed to the flash step (step 1) instead of failing.
+		glOut := sshRun(client, "cat /etc/gl-inet-release 2>/dev/null || echo ''")
+		glOut = strings.TrimSpace(glOut)
+		if glOut != "" {
+			isStockGL = true
+			glModel, _ = parseGLInetRelease(glOut)
+			glModel = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(glModel), " ", "-"))
+			if glModel == "" {
+				glModel = strings.TrimSpace(sshRun(client, "cat /tmp/sysinfo/board_name 2>/dev/null"))
+			}
+			job.addLog("Detected stock GL.iNet firmware (model: " + glModel + ")")
+			job.setStep(0, "done", "GL.iNet "+glModel)
+		} else {
+			job.setStep(0, "failed", "Router is not running OpenWrt")
+			job.mu.Lock()
+			job.Status = "failed"
+			job.Error = "Router is not running OpenWrt firmware"
+			job.mu.Unlock()
+			return
+		}
+	} else {
+		job.addLog("SSH OK. Firmware: " + truncate(fwOut, 100))
+		job.setStep(0, "done", truncate(fwOut, 100))
 	}
-	job.addLog("SSH OK. Firmware: " + truncate(fwOut, 100))
-	job.setStep(0, "done", truncate(fwOut, 100))
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 1: Check firmware
+	// Step 1: Flash OpenWrt on stock GL.iNet (skipped if already OpenWrt)
 	job.setStep(1, "running", "")
+	if isStockGL {
+		job.addLog("Flashing OpenWrt on GL.iNet " + glModel + "...")
+
+		img, ok := glModelMap[glModel]
+		if !ok {
+			jobFail(job, 1, "Unknown GL.iNet model: "+glModel, "Unknown GL.iNet model "+glModel+". Please update the model table in images.go or flash manually.")
+			return
+		}
+
+		// Download the image on the laptop (not the router — limited storage).
+		// USE httpGetFile (deploy.go:756) — the codebase's established download
+		// helper with 60s timeout, redirect following, and a 64MB LimitReader
+		// guard. Raw http.Get is NOT used (no timeout/redirect/size handling).
+		imageURL := img.URL()
+		job.addLog("Downloading: " + imageURL)
+		imageData, err := httpGetFile(imageURL)
+		if err != nil {
+			jobFail(job, 1, "Download failed: "+err.Error(), "Failed to download OpenWrt image: "+err.Error())
+			return
+		}
+		job.addLog(fmt.Sprintf("Downloaded %d KB", len(imageData)/1024))
+
+		// Push the image to the router via the SSH stdin pipe.
+		// USE sshUploadPipe (ssh.go:74) — same pattern as the package-install
+		// step (deploy.go:157). A function called "sshWrite" does NOT exist.
+		pushOut := sshUploadPipe(client, imageData, "cat > /tmp/openwrt-sysupgrade.bin && echo PUSH_OK")
+		if !strings.Contains(pushOut, "PUSH_OK") {
+			jobFail(job, 1, "Image push failed", "Failed to push OpenWrt image to router: "+truncate(pushOut, 80))
+			return
+		}
+		job.addLog("Image pushed to router")
+
+		// Run sysupgrade. The router will go down and reboot onto OpenWrt.
+		upgradeOut := sshRun(client, "sysupgrade -n /tmp/openwrt-sysupgrade.bin 2>&1")
+		job.addLog("sysupgrade: " + truncate(upgradeOut, 200))
+
+		// Wait for the router to reboot. Stock GL.iNet uses 192.168.8.1,
+		// OpenWrt defaults to 192.168.1.1.
+		job.addLog("Router rebooting. Waiting for it to come back...")
+		time.Sleep(120 * time.Second)
+
+		// Reconnect to the new OpenWrt IP.
+		// CRITICAL: after `sysupgrade -n` the fresh OpenWrt root password is
+		// EMPTY — req.Password will fail. USE reconnectSSH (deploy.go:598)
+		// which retries AND falls back to empty-password auth.
+		newIP := req.IP
+		newClient := reconnectSSH(req.IP, req.Password, 3, 2*time.Second)
+		if newClient == nil && req.IP != "192.168.1.1" {
+			newClient = reconnectSSH("192.168.1.1", req.Password, 3, 2*time.Second)
+			if newClient != nil {
+				newIP = "192.168.1.1"
+			}
+		}
+		if newClient == nil {
+			jobFail(job, 1, "Router unreachable after flash", "Router did not come back after flash. Last known IP: "+req.IP+". See manual recovery docs (GL.iNet recovery mode).")
+			return
+		}
+		client.Close()
+		client = newClient
+		job.addLog("Reconnected to router at " + newIP)
+		job.setStep(1, "done", "OpenWrt flashed on "+glModel)
+	} else {
+		job.setStep(1, "done", "skipped (already OpenWrt)")
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 2: Check firmware
+	job.setStep(2, "running", "")
 	versionLine := ""
 	for _, line := range strings.Split(fwOut, "\n") {
 		if strings.Contains(line, "DISTRIB_DESCRIPTION") {
@@ -92,41 +179,41 @@ func runDeployment(job *Job, req deployRequest) {
 		}
 	}
 	job.addLog("Firmware: " + versionLine)
-	job.setStep(1, "done", versionLine)
+	job.setStep(2, "done", versionLine)
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 2: Set root password
-	job.setStep(2, "running", "")
+	// Step 3: Set root password
+	job.setStep(3, "running", "")
 	if req.Password != "" {
 		passwdCmd := "echo -e '" + req.Password + "\\n" + req.Password + "' | passwd root 2>&1"
 		passwdOut := sshRun(client, passwdCmd)
 		if strings.Contains(passwdOut, "changed") || strings.Contains(passwdOut, "successfully") {
 			job.addLog("Root password set")
-			job.setStep(2, "done", "password updated")
+			job.setStep(3, "done", "password updated")
 		} else {
 			job.addLog("Password set (may already be set)")
-			job.setStep(2, "done", "password set")
+			job.setStep(3, "done", "password set")
 		}
 	} else {
-		job.setStep(2, "done", "skipped (no password)")
+		job.setStep(3, "done", "skipped (no password)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 3: Configure upstream (WiFi STA if requested)
-	job.setStep(3, "running", "")
+	// Step 4: Configure upstream (WiFi STA if requested)
+	job.setStep(4, "running", "")
 	if req.Mode == "sta" && req.SSID != "" {
 		if !configureSTA(job, &client, req.IP, req.Password, req.SSID, req.WifiPass) {
 			return
 		}
 	} else {
 		job.addLog("Using WAN upstream (default)")
-		job.setStep(3, "done", "WAN mode (default)")
+		job.setStep(4, "done", "WAN mode (default)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 4: Install tollgate package from GitHub releases
+	// Step 5: Install tollgate package from GitHub releases
 	// OpenWrt 25+ uses apk; OpenWrt 24.x uses opkg. Detect at runtime.
-	job.setStep(4, "running", "")
+	job.setStep(5, "running", "")
 	pkgMgr := strings.TrimSpace(sshRun(client, "command -v apk >/dev/null 2>&1 && echo apk || echo opkg"))
 
 	// Select appropriate package URL based on package manager
@@ -244,7 +331,7 @@ func runDeployment(job *Job, req deployRequest) {
 		// will crash against it — treat as a hard failure even if the binary exists.
 		if strings.Contains(installOut, "Not downgrading") {
 			job.addLog("ERROR: opkg refused to downgrade the package (old version kept)")
-			job.setStep(4, "error", "opkg refused to downgrade tollgate-wrt")
+			job.setStep(5, "error", "opkg refused to downgrade tollgate-wrt")
 			return
 		}
 		// Verify the binary actually exists (secondary check)
@@ -253,7 +340,7 @@ func runDeployment(job *Job, req deployRequest) {
 			// NOTE (SW4a): the fw4/nftables enforcement rules (PR #283) ship
 			// inside the package under /etc/nftables.d/{20-nds-enforce,30-backend-firewall}.nft —
 			// no separate overlay download is performed (the old overlay URL 404'd).
-			job.setStep(4, "done", "tollgate-wrt installed via "+pkgMgr)
+			job.setStep(5, "done", "tollgate-wrt installed via "+pkgMgr)
 			installedOK = true
 		}
 	}
@@ -275,18 +362,18 @@ func runDeployment(job *Job, req deployRequest) {
 			// is left in its pre-deploy state.
 			job.addLog("Rolling back wireless config (pre-deploy snapshot)...")
 			rollbackWireless(client)
-			jobFail(job, 4, "tollgate-wrt install failed", "Package installation failed — wireless config rolled back")
+			jobFail(job, 5, "tollgate-wrt install failed", "Package installation failed — wireless config rolled back")
 			return
 		}
-		job.setStep(4, "done", tollgatePackage+" installed (feed, "+pkgMgr+")")
+		job.setStep(5, "done", tollgatePackage+" installed (feed, "+pkgMgr+")")
 	}
 
 	// The .ipk now ships gonuts v0.11.1 with all keyset/multimint/existing-wallet
 	// fixes built in — no binary replacement needed.
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 5: Brand as TollGate — hostname, SSID, DNS, nodogsplash config
-	job.setStep(5, "running", "")
+	// Step 6: Brand as TollGate — hostname, SSID, DNS, nodogsplash config
+	job.setStep(6, "running", "")
 	// Generate unique suffix (e.g. tollgate-a7f2) so multiple routers don't clash
 	const ssidChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	suffix := make([]byte, 4)
@@ -379,34 +466,34 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	if strings.Contains(brandOut, "branded") {
 		job.addLog("Branded: hostname=" + nodeName + ", SSID=" + nodeName + ", DNS=tollgate.lan")
-		job.setStep(5, "done", "hostname+SSID+DNS+nodogsplash")
+		job.setStep(6, "done", "hostname+SSID+DNS+nodogsplash")
 	} else {
 		job.addLog("Branding attempted: " + truncate(brandOut, 60))
-		job.setStep(5, "done", "configured (partial)")
+		job.setStep(6, "done", "configured (partial)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 6: Verify the captive portal shipped by the tollgate-wrt package.
+	// Step 7: Verify the captive portal shipped by the tollgate-wrt package.
 	// The wizard no longer embeds a portal/ directory — the tollgate-wrt
 	// .ipk installs tollgate-captive-portal-site via its uci-defaults, so
 	// this step is a lightweight verification that the portal is present.
-	job.setStep(6, "running", "")
+	job.setStep(7, "running", "")
 	portalCheck := sshRun(client, "test -d /etc/tollgate/tollgate-captive-portal-site && echo ok || echo missing")
 	if strings.TrimSpace(portalCheck) == "ok" {
 		job.addLog("Captive portal present at /etc/tollgate/tollgate-captive-portal-site")
-		job.setStep(6, "done", "portal shipped by tollgate-wrt package")
+		job.setStep(7, "done", "portal shipped by tollgate-wrt package")
 	} else {
 		job.addLog("WARNING: captive portal directory not found on router")
-		job.setStep(6, "done", "portal not found (installed by .ipk)")
+		job.setStep(7, "done", "portal not found (installed by .ipk)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 7: Configure Lightning address + advanced defaults.
+	// Step 8: Configure Lightning address + advanced defaults.
 	// lightning_address goes into identities.json → public_identities[].lightning_address
 	// (per tollgate-module-basic-go's schema — it reads ONLY from identities.json,
 	// never from config.json). margin and profit_share factors go into config.json.
 	// If files are absent (tollgate not yet installed), we skip gracefully.
-	job.setStep(7, "running", "")
+	job.setStep(8, "running", "")
 
 	// 8a: Write lightning_address to identities.json (owner identity).
 	lnCmd := "jq --arg la '" + req.LNURL + "' " +
@@ -463,23 +550,23 @@ func runDeployment(job *Job, req deployRequest) {
 	// 8c: Default mints already injected in 8b above (accepted_mints array).
 
 	if strings.Contains(lnOut, "identities updated") || strings.Contains(cfgOut, "config updated") {
-		job.setStep(7, "done", "LNURL: "+req.LNURL)
+		job.setStep(8, "done", "LNURL: "+req.LNURL)
 	} else {
 		job.addLog("Config update skipped — no tollgate files found")
 		job.addLog("identities: " + truncate(lnOut, 60))
 		job.addLog("config: " + truncate(cfgOut, 60))
-		job.setStep(7, "done", "skipped (no tollgate config)")
+		job.setStep(8, "done", "skipped (no tollgate config)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 9: Restart services
-	job.setStep(8, "running", "")
+	// Step 10: Restart services
+	job.setStep(9, "running", "")
 	job.addLog("Restarting services...")
 	// Verify tollgate-wrt init script exists before restart
 	initCheck := sshRun(client, "ls /etc/init.d/tollgate-wrt 2>/dev/null && echo 'exists' || echo 'missing'")
 	if strings.Contains(initCheck, "missing") {
 		job.addLog("ERROR: tollgate-wrt init script not found — package install failed")
-		jobFail(job, 8, "tollgate-wrt not installed", "tollgate-wrt init script missing — package install failed")
+		jobFail(job, 9, "tollgate-wrt not installed", "tollgate-wrt init script missing — package install failed")
 		return
 	}
 	svcOut := sshRun(client, strings.Join([]string{
@@ -495,11 +582,11 @@ func runDeployment(job *Job, req deployRequest) {
 		"echo 'services restarted'",
 	}, "; "))
 	job.addLog("Services restarted: " + truncate(svcOut, 60))
-	job.setStep(8, "done", "tollgate-wrt+nodogsplash+uhttpd")
+	job.setStep(9, "done", "tollgate-wrt+nodogsplash+uhttpd")
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 10: Health check
-	job.setStep(9, "running", "")
+	// Step 11: Health check
+	job.setStep(10, "running", "")
 	job.addLog("Running health check...")
 	// Retry health check up to 5 times — a single wget 3.5s after service
 	// restart is too fast: the freshly-installed binary may still be starting,
@@ -518,7 +605,7 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	if healthOK {
 		job.addLog("Health check passed — TollGate API responding")
-		job.setStep(9, "done", "API healthy on :2121")
+		job.setStep(10, "done", "API healthy on :2121")
 	} else {
 		job.addLog("Health check FAILED: " + truncate(healthOut, 80))
 		// Roll back wireless config so the router's radios are usable for
@@ -527,7 +614,7 @@ func runDeployment(job *Job, req deployRequest) {
 		job.addLog("Rolling back wireless config to pre-deploy state...")
 		rollbackWireless(client)
 		job.addLog("Wireless config restored — radios should be available for scanning")
-		jobFail(job, 9, "tollgate API not responding on :2121", "Health check failed — wireless config rolled back for recovery")
+		jobFail(job, 10, "tollgate API not responding on :2121", "Health check failed — wireless config rolled back for recovery")
 		return
 	}
 
@@ -635,13 +722,13 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 	job.addLog("Configuring WiFi STA uplink: " + ssid)
 	out := sshRun(client, staSetupScript(ssid, wifiPass))
 	if strings.Contains(out, "NO_RADIO") {
-		jobFail(job, 3, "no wireless radio found", "No wifi-device found in UCI — cannot configure STA uplink")
+		jobFail(job, 4, "no wireless radio found", "No wifi-device found in UCI — cannot configure STA uplink")
 		return false
 	}
 	if !strings.Contains(out, "STA_CFG_OK") {
 		job.addLog("STA configuration failed: " + truncate(out, 120))
 		rollbackWireless(client)
-		jobFail(job, 3, "STA configuration error", "Failed to configure WiFi STA mode")
+		jobFail(job, 4, "STA configuration error", "Failed to configure WiFi STA mode")
 		return false
 	}
 	radio := "radio0"
@@ -668,7 +755,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 			rollbackWireless(retry)
 			retry.Close()
 		}
-		jobFail(job, 3, "SSH lost after wifi reload",
+		jobFail(job, 4, "SSH lost after wifi reload",
 			"SSH connection lost after wifi reload and could not be re-established — wireless config rolled back if the router was reachable")
 		return false
 	}
@@ -688,7 +775,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 	if !up {
 		job.addLog("WiFi STA verification failed — wwan interface not up")
 		rollbackWireless(client)
-		jobFail(job, 3, "WiFi connection failed — check SSID and password",
+		jobFail(job, 4, "WiFi connection failed — check SSID and password",
 			"WiFi STA connection failed for \""+ssid+"\" — check SSID and password (wireless config rolled back)")
 		return false
 	}
@@ -745,7 +832,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 		}
 	}
 
-	job.setStep(3, "done", "STA mode: "+ssid)
+	job.setStep(4, "done", "STA mode: "+ssid)
 	return true
 }
 
