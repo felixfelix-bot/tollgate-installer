@@ -2,10 +2,14 @@ package main
 
 import (
 	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +37,7 @@ const (
 func deploySteps() []Step {
 	return []Step{
 		{Name: "verify", Desc: "Verifying SSH access to router...", Status: "pending"},
+		{Name: "stage", Desc: "Pre-downloading packages and firmware...", Status: "pending"},
 		{Name: "flash", Desc: "Flashing OpenWrt on stock GL.iNet...", Status: "pending"},
 		{Name: "firmware", Desc: "Checking firmware version...", Status: "pending"},
 		{Name: "password", Desc: "Setting root password...", Status: "pending"},
@@ -73,7 +78,7 @@ func runDeployment(job *Job, req deployRequest) {
 	var glModel string
 	if fwOut == "not openwrt" || fwOut == "" {
 		// Not OpenWrt — check for stock GL.iNet firmware. If present, we
-		// proceed to the flash step (step 1) instead of failing.
+		// proceed to the flash step (step 2) instead of failing.
 		glOut := sshRun(client, "cat /etc/gl-inet-release 2>/dev/null || echo ''")
 		glOut = strings.TrimSpace(glOut)
 		if glOut != "" {
@@ -99,30 +104,50 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 1: Flash OpenWrt on stock GL.iNet (skipped if already OpenWrt)
+	// Step 1: Stage — pre-download deploy assets (optional; req.PreStage).
+	// If the operator asked for it, pre-download every asset the deploy will
+	// need into the Job's stageCache NOW, while the laptop's current
+	// internet path is still up. This matters when the laptop's only
+	// internet is via the router being flashed or reconfigured (STA mode):
+	// the flash/install steps later consume the staged bytes instead of
+	// fetching live. Runs immediately after verify (glModel/isStockGL from
+	// the SSH probe are required to pick the right image/package URLs) and
+	// before flash. Failures are non-fatal — the existing live-fetch →
+	// router-wget → feed fallbacks remain on a cache miss.
 	job.setStep(1, "running", "")
+	if req.PreStage {
+		runPreStage(job, client, isStockGL, glModel)
+		job.setStep(1, "done", "deploy assets pre-downloaded")
+	} else {
+		job.setStep(1, "done", "skipped (no pre-stage requested)")
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 2: Flash OpenWrt on stock GL.iNet (skipped if already OpenWrt)
+	job.setStep(2, "running", "")
 	if isStockGL {
 		job.addLog("Flashing OpenWrt on GL.iNet " + glModel + "...")
 
 		img, ok := glModelMap[glModel]
 		if !ok {
-			jobFail(job, 1, "Unknown GL.iNet model: "+glModel, "Unknown GL.iNet model "+glModel+". Please update the model table in images.go or flash manually.")
+			jobFail(job, 2, "Unknown GL.iNet model: "+glModel, "Unknown GL.iNet model "+glModel+". Please update the model table in images.go or flash manually.")
 			return
 		}
 
-		// Download the image on the laptop (not the router — limited storage).
-		// USE downloadWithRetry (3 attempts, exponential backoff) — transient
-		// network errors and 5xx are retried; a definitive 4xx (bad image pin)
-		// fails immediately. Raw http.Get is NOT used (no timeout/redirect/size
-		// handling).
+		// Obtain the image on the laptop (not the router — limited storage).
+		// USE the staging cache first: when the PreStage step pre-downloaded
+		// this exact image URL, flashImageBytes serves the staged bytes with
+		// zero network (the offline case staging exists for). On a cache miss
+		// it downloads live via downloadWithRetry (3 attempts, exponential
+		// backoff) — transient network errors and 5xx are retried; a definitive
+		// 4xx (bad image pin) fails immediately. Raw http.Get is NOT used (no
+		// timeout/redirect/size handling).
 		imageURL := img.URL()
-		job.addLog("Downloading: " + imageURL)
-		imageData, err := downloadWithRetry(imageURL, 3, 2*time.Second)
+		imageData, err := flashImageBytes(job, imageURL)
 		if err != nil {
-			jobFail(job, 1, "Download failed after 3 attempts: "+err.Error(), "Failed to download OpenWrt image after 3 attempts: "+err.Error()+"\nURL: "+imageURL)
+			jobFail(job, 2, "Download failed after 3 attempts: "+err.Error(), "Failed to download OpenWrt image after 3 attempts: "+err.Error()+"\nURL: "+imageURL)
 			return
 		}
-		job.addLog(fmt.Sprintf("Downloaded %d KB", len(imageData)/1024))
 
 		// Push the image to the router via the SSH stdin pipe.
 		// USE sshUploadPipe (ssh.go:74) — same pattern as the package-install
@@ -133,7 +158,7 @@ func runDeployment(job *Job, req deployRequest) {
 			// whether it's a full /tmp (common on small-flash GL.iNet boards)
 			// vs a network/SSH problem.
 			dfOut := sshRun(client, "df -h /tmp 2>&1")
-			jobFail(job, 1, "Image push failed", "Failed to push OpenWrt image to router: "+truncate(pushOut, 80)+"\nRouter /tmp storage:\n"+truncate(dfOut, 200)+"\nIf /tmp is full, free space (remove old images) and retry, or flash manually via GL.iNet recovery mode.")
+			jobFail(job, 2, "Image push failed", "Failed to push OpenWrt image to router: "+truncate(pushOut, 80)+"\nRouter /tmp storage:\n"+truncate(dfOut, 200)+"\nIf /tmp is full, free space (remove old images) and retry, or flash manually via GL.iNet recovery mode.")
 			return
 		}
 		job.addLog("Image pushed to router")
@@ -146,7 +171,7 @@ func runDeployment(job *Job, req deployRequest) {
 		// 3 minutes for a router that never reboots.
 		if strings.Contains(upgradeOut, "failed") || strings.Contains(upgradeOut, "error") ||
 			strings.Contains(upgradeOut, "not found") || strings.Contains(upgradeOut, "invalid") {
-			jobFail(job, 1, "sysupgrade failed", parseSysupgradeError(upgradeOut))
+			jobFail(job, 2, "sysupgrade failed", parseSysupgradeError(upgradeOut))
 			return
 		}
 
@@ -171,20 +196,20 @@ func runDeployment(job *Job, req deployRequest) {
 			}
 		}
 		if err != nil {
-			jobFail(job, 1, "Router unreachable after flash", "Router did not come back after flash. Last known IP: "+req.IP+". See manual recovery docs (GL.iNet recovery mode).")
+			jobFail(job, 2, "Router unreachable after flash", "Router did not come back after flash. Last known IP: "+req.IP+". See manual recovery docs (GL.iNet recovery mode).")
 			return
 		}
 		client.Close()
 		client = newClient
 		job.addLog("Reconnected to router at " + newIP)
-		job.setStep(1, "done", "OpenWrt flashed on "+glModel)
+		job.setStep(2, "done", "OpenWrt flashed on "+glModel)
 	} else {
-		job.setStep(1, "done", "skipped (already OpenWrt)")
+		job.setStep(2, "done", "skipped (already OpenWrt)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 2: Check firmware
-	job.setStep(2, "running", "")
+	// Step 3: Check firmware
+	job.setStep(3, "running", "")
 	versionLine := ""
 	for _, line := range strings.Split(fwOut, "\n") {
 		if strings.Contains(line, "DISTRIB_DESCRIPTION") {
@@ -195,41 +220,41 @@ func runDeployment(job *Job, req deployRequest) {
 		}
 	}
 	job.addLog("Firmware: " + versionLine)
-	job.setStep(2, "done", versionLine)
+	job.setStep(3, "done", versionLine)
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 3: Set root password
-	job.setStep(3, "running", "")
+	// Step 4: Set root password
+	job.setStep(4, "running", "")
 	if req.Password != "" {
 		passwdCmd := "echo -e '" + req.Password + "\\n" + req.Password + "' | passwd root 2>&1"
 		passwdOut := sshRun(client, passwdCmd)
 		if strings.Contains(passwdOut, "changed") || strings.Contains(passwdOut, "successfully") {
 			job.addLog("Root password set")
-			job.setStep(3, "done", "password updated")
+			job.setStep(4, "done", "password updated")
 		} else {
 			job.addLog("Password set (may already be set)")
-			job.setStep(3, "done", "password set")
+			job.setStep(4, "done", "password set")
 		}
 	} else {
-		job.setStep(3, "done", "skipped (no password)")
+		job.setStep(4, "done", "skipped (no password)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 4: Configure upstream (WiFi STA if requested)
-	job.setStep(4, "running", "")
+	// Step 5: Configure upstream (WiFi STA if requested)
+	job.setStep(5, "running", "")
 	if req.Mode == "sta" && req.SSID != "" {
 		if !configureSTA(job, &client, req.IP, req.Password, req.SSID, req.WifiPass) {
 			return
 		}
 	} else {
 		job.addLog("Using WAN upstream (default)")
-		job.setStep(4, "done", "WAN mode (default)")
+		job.setStep(5, "done", "WAN mode (default)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 5: Install tollgate package from GitHub releases
+	// Step 6: Install tollgate package from GitHub releases
 	// OpenWrt 25+ uses apk; OpenWrt 24.x uses opkg. Detect at runtime.
-	job.setStep(5, "running", "")
+	job.setStep(6, "running", "")
 	pkgMgr := strings.TrimSpace(sshRun(client, "command -v apk >/dev/null 2>&1 && echo apk || echo opkg"))
 
 	// Select appropriate package URL based on package manager
@@ -251,21 +276,29 @@ func runDeployment(job *Job, req deployRequest) {
 	// Sync from the laptop clock before any router-side download attempt.
 	sshRun(client, "date -s @"+strconv.FormatInt(time.Now().Unix(), 10)+" >/dev/null 2>&1; true")
 
-	// PRIMARY: download the package on the LAPTOP and push it over SSH stdin.
-	// This eliminates the router's DNS/TLS stack from the critical path —
-	// a freshly STA-connected router often has no working DNS yet.
-	job.addLog("Downloading tollgate-wrt v0.7.0-alpha10 " + pkgExtension + " (laptop-side)...")
+	// PRIMARY: prefer the tollgate-wrt bytes the PreStage step cached for this
+	// exact URL — the point of staging is that the actual install performs zero
+	// network fetches. On a cache miss, download the package on the LAPTOP and
+	// push it over SSH stdin. Pushing eliminates the router's DNS/TLS stack
+	// from the critical path — a freshly STA-connected router often has no
+	// working DNS yet. A live-fetch failure falls through to the router-side
+	// wget (and then feed) paths below.
 	pkgOnRouter := false
-	if data, err := httpGetFile(selectedPkgURL); err == nil && len(data) > 0 {
-		push := sshUploadPipe(client, data, "cat > /tmp/tollgate-wrt"+pkgExtension+" && echo PUSH_OK")
+	pkgData, pkgFromCache, pkgErr := stagedOrLiveBytes(job, "tollgate-wrt "+pkgExtension, selectedPkgURL)
+	if pkgErr == nil && len(pkgData) > 0 {
+		push := sshUploadPipe(client, pkgData, "cat > /tmp/tollgate-wrt"+pkgExtension+" && echo PUSH_OK")
 		if strings.Contains(push, "PUSH_OK") {
 			pkgOnRouter = true
-			job.addLog(fmt.Sprintf("Package downloaded on laptop (%d KB), pushed to router via SSH", len(data)/1024))
+			if pkgFromCache {
+				job.addLog(fmt.Sprintf("Staged tollgate-wrt %s used from cache (%d KB), pushed to router via SSH", pkgExtension, len(pkgData)/1024))
+			} else {
+				job.addLog(fmt.Sprintf("Package downloaded on laptop (%d KB), pushed to router via SSH", len(pkgData)/1024))
+			}
 		} else {
 			job.addLog("SSH push failed: " + truncate(push, 80))
 		}
-	} else if err != nil {
-		job.addLog("Laptop download failed: " + truncate(err.Error(), 80) + " — falling back to router-side wget")
+	} else if pkgErr != nil {
+		job.addLog("Laptop download failed: " + truncate(pkgErr.Error(), 80) + " — falling back to router-side wget")
 	}
 
 	// FALLBACK: router-side wget, with a real DNS probe and wget's stderr
@@ -310,20 +343,28 @@ func runDeployment(job *Job, req deployRequest) {
 				ndsPkg := extractIPKFilename(ndsListHTML, "nodogsplash")
 				jqPkg := extractIPKFilename(jqListHTML, "jq")
 				if ndsPkg != "" {
-					ndsData, ndsErr := httpGetFile(routingURL + ndsPkg)
+					ndsData, ndsFromCache, ndsErr := stagedOrLiveBytes(job, "nodogsplash .ipk", routingURL+ndsPkg)
 					if ndsErr == nil && len(ndsData) > 1000 {
 						pushNds := sshUploadPipe(client, ndsData, "cat > /tmp/"+ndsPkg+" && echo NDS_PUSHED")
 						if strings.Contains(pushNds, "NDS_PUSHED") {
-							job.addLog(fmt.Sprintf("nodogsplash .ipk downloaded (%d KB), pushed to router", len(ndsData)/1024))
+							if ndsFromCache {
+								job.addLog(fmt.Sprintf("nodogsplash .ipk used from staging cache (%d KB), pushed to router", len(ndsData)/1024))
+							} else {
+								job.addLog(fmt.Sprintf("nodogsplash .ipk downloaded (%d KB), pushed to router", len(ndsData)/1024))
+							}
 						}
 					}
 				}
 				if jqPkg != "" {
-					jqData, jqErr := httpGetFile(packagesURL + jqPkg)
+					jqData, jqFromCache, jqErr := stagedOrLiveBytes(job, "jq .ipk", packagesURL+jqPkg)
 					if jqErr == nil && len(jqData) > 1000 {
 						pushJq := sshUploadPipe(client, jqData, "cat > /tmp/"+jqPkg+" && echo JQ_PUSHED")
 						if strings.Contains(pushJq, "JQ_PUSHED") {
-							job.addLog(fmt.Sprintf("jq .ipk downloaded (%d KB), pushed to router", len(jqData)/1024))
+							if jqFromCache {
+								job.addLog(fmt.Sprintf("jq .ipk used from staging cache (%d KB), pushed to router", len(jqData)/1024))
+							} else {
+								job.addLog(fmt.Sprintf("jq .ipk downloaded (%d KB), pushed to router", len(jqData)/1024))
+							}
 						}
 					}
 				}
@@ -347,7 +388,7 @@ func runDeployment(job *Job, req deployRequest) {
 		// will crash against it — treat as a hard failure even if the binary exists.
 		if strings.Contains(installOut, "Not downgrading") {
 			job.addLog("ERROR: opkg refused to downgrade the package (old version kept)")
-			job.setStep(5, "error", "opkg refused to downgrade tollgate-wrt")
+			job.setStep(6, "error", "opkg refused to downgrade tollgate-wrt")
 			return
 		}
 		// Verify the binary actually exists (secondary check)
@@ -356,7 +397,7 @@ func runDeployment(job *Job, req deployRequest) {
 			// NOTE (SW4a): the fw4/nftables enforcement rules (PR #283) ship
 			// inside the package under /etc/nftables.d/{20-nds-enforce,30-backend-firewall}.nft —
 			// no separate overlay download is performed (the old overlay URL 404'd).
-			job.setStep(5, "done", "tollgate-wrt installed via "+pkgMgr)
+			job.setStep(6, "done", "tollgate-wrt installed via "+pkgMgr)
 			installedOK = true
 		}
 	}
@@ -378,18 +419,18 @@ func runDeployment(job *Job, req deployRequest) {
 			// is left in its pre-deploy state.
 			job.addLog("Rolling back wireless config (pre-deploy snapshot)...")
 			rollbackWireless(client)
-			jobFail(job, 5, "tollgate-wrt install failed", "Package installation failed — wireless config rolled back")
+			jobFail(job, 6, "tollgate-wrt install failed", "Package installation failed — wireless config rolled back")
 			return
 		}
-		job.setStep(5, "done", tollgatePackage+" installed (feed, "+pkgMgr+")")
+		job.setStep(6, "done", tollgatePackage+" installed (feed, "+pkgMgr+")")
 	}
 
 	// The .ipk now ships gonuts v0.11.1 with all keyset/multimint/existing-wallet
 	// fixes built in — no binary replacement needed.
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 6: Brand as TollGate — hostname, SSID, DNS, nodogsplash config
-	job.setStep(6, "running", "")
+	// Step 7: Brand as TollGate — hostname, SSID, DNS, nodogsplash config
+	job.setStep(7, "running", "")
 	// Generate unique suffix (e.g. tollgate-a7f2) so multiple routers don't clash
 	const ssidChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	suffix := make([]byte, 4)
@@ -482,34 +523,34 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	if strings.Contains(brandOut, "branded") {
 		job.addLog("Branded: hostname=" + nodeName + ", SSID=" + nodeName + ", DNS=tollgate.lan")
-		job.setStep(6, "done", "hostname+SSID+DNS+nodogsplash")
+		job.setStep(7, "done", "hostname+SSID+DNS+nodogsplash")
 	} else {
 		job.addLog("Branding attempted: " + truncate(brandOut, 60))
-		job.setStep(6, "done", "configured (partial)")
+		job.setStep(7, "done", "configured (partial)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 7: Verify the captive portal shipped by the tollgate-wrt package.
+	// Step 8: Verify the captive portal shipped by the tollgate-wrt package.
 	// The wizard no longer embeds a portal/ directory — the tollgate-wrt
 	// .ipk installs tollgate-captive-portal-site via its uci-defaults, so
 	// this step is a lightweight verification that the portal is present.
-	job.setStep(7, "running", "")
+	job.setStep(8, "running", "")
 	portalCheck := sshRun(client, "test -d /etc/tollgate/tollgate-captive-portal-site && echo ok || echo missing")
 	if strings.TrimSpace(portalCheck) == "ok" {
 		job.addLog("Captive portal present at /etc/tollgate/tollgate-captive-portal-site")
-		job.setStep(7, "done", "portal shipped by tollgate-wrt package")
+		job.setStep(8, "done", "portal shipped by tollgate-wrt package")
 	} else {
 		job.addLog("WARNING: captive portal directory not found on router")
-		job.setStep(7, "done", "portal not found (installed by .ipk)")
+		job.setStep(8, "done", "portal not found (installed by .ipk)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 8: Configure Lightning address + advanced defaults.
+	// Step 9: Configure Lightning address + advanced defaults.
 	// lightning_address goes into identities.json → public_identities[].lightning_address
 	// (per tollgate-module-basic-go's schema — it reads ONLY from identities.json,
 	// never from config.json). margin and profit_share factors go into config.json.
 	// If files are absent (tollgate not yet installed), we skip gracefully.
-	job.setStep(8, "running", "")
+	job.setStep(9, "running", "")
 
 	// 8a: Write lightning_address to identities.json (owner identity).
 	lnCmd := "jq --arg la '" + req.LNURL + "' " +
@@ -566,23 +607,23 @@ func runDeployment(job *Job, req deployRequest) {
 	// 8c: Default mints already injected in 8b above (accepted_mints array).
 
 	if strings.Contains(lnOut, "identities updated") || strings.Contains(cfgOut, "config updated") {
-		job.setStep(8, "done", "LNURL: "+req.LNURL)
+		job.setStep(9, "done", "LNURL: "+req.LNURL)
 	} else {
 		job.addLog("Config update skipped — no tollgate files found")
 		job.addLog("identities: " + truncate(lnOut, 60))
 		job.addLog("config: " + truncate(cfgOut, 60))
-		job.setStep(8, "done", "skipped (no tollgate config)")
+		job.setStep(9, "done", "skipped (no tollgate config)")
 	}
 	time.Sleep(500 * time.Millisecond)
 
 	// Step 10: Restart services
-	job.setStep(9, "running", "")
+	job.setStep(10, "running", "")
 	job.addLog("Restarting services...")
 	// Verify tollgate-wrt init script exists before restart
 	initCheck := sshRun(client, "ls /etc/init.d/tollgate-wrt 2>/dev/null && echo 'exists' || echo 'missing'")
 	if strings.Contains(initCheck, "missing") {
 		job.addLog("ERROR: tollgate-wrt init script not found — package install failed")
-		jobFail(job, 9, "tollgate-wrt not installed", "tollgate-wrt init script missing — package install failed")
+		jobFail(job, 10, "tollgate-wrt not installed", "tollgate-wrt init script missing — package install failed")
 		return
 	}
 	svcOut := sshRun(client, strings.Join([]string{
@@ -598,11 +639,11 @@ func runDeployment(job *Job, req deployRequest) {
 		"echo 'services restarted'",
 	}, "; "))
 	job.addLog("Services restarted: " + truncate(svcOut, 60))
-	job.setStep(9, "done", "tollgate-wrt+nodogsplash+uhttpd")
+	job.setStep(10, "done", "tollgate-wrt+nodogsplash+uhttpd")
 	time.Sleep(500 * time.Millisecond)
 
 	// Step 11: Health check
-	job.setStep(10, "running", "")
+	job.setStep(11, "running", "")
 	job.addLog("Running health check...")
 	// Retry health check up to 5 times — a single wget 3.5s after service
 	// restart is too fast: the freshly-installed binary may still be starting,
@@ -621,7 +662,7 @@ func runDeployment(job *Job, req deployRequest) {
 	}
 	if healthOK {
 		job.addLog("Health check passed — TollGate API responding")
-		job.setStep(10, "done", "API healthy on :2121")
+		job.setStep(11, "done", "API healthy on :2121")
 	} else {
 		job.addLog("Health check FAILED: " + truncate(healthOut, 80))
 		// Roll back wireless config so the router's radios are usable for
@@ -630,7 +671,7 @@ func runDeployment(job *Job, req deployRequest) {
 		job.addLog("Rolling back wireless config to pre-deploy state...")
 		rollbackWireless(client)
 		job.addLog("Wireless config restored — radios should be available for scanning")
-		jobFail(job, 10, "tollgate API not responding on :2121", "Health check failed — wireless config rolled back for recovery")
+		jobFail(job, 11, "tollgate API not responding on :2121", "Health check failed — wireless config rolled back for recovery")
 		return
 	}
 
@@ -800,7 +841,7 @@ func ifaceUp(statusJSON string) bool {
 	return up
 }
 
-// configureSTA wires up the tollgate_uplink WiFi STA (deploy step 3).
+// configureSTA wires up the tollgate_uplink WiFi STA (deploy step 5).
 // Returns false after marking the job failed; any failure AFTER the
 // wireless snapshot restores the snapshot and reloads wifi (rollback).
 //
@@ -812,13 +853,13 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 	job.addLog("Configuring WiFi STA uplink: " + ssid)
 	out := sshRun(client, staSetupScript(ssid, wifiPass))
 	if strings.Contains(out, "NO_RADIO") {
-		jobFail(job, 4, "no wireless radio found", "No wifi-device found in UCI — cannot configure STA uplink")
+		jobFail(job, 5, "no wireless radio found", "No wifi-device found in UCI — cannot configure STA uplink")
 		return false
 	}
 	if !strings.Contains(out, "STA_CFG_OK") {
 		job.addLog("STA configuration failed: " + truncate(out, 120))
 		rollbackWireless(client)
-		jobFail(job, 4, "STA configuration error", "Failed to configure WiFi STA mode")
+		jobFail(job, 5, "STA configuration error", "Failed to configure WiFi STA mode")
 		return false
 	}
 	radio := "radio0"
@@ -845,7 +886,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 			rollbackWireless(retry)
 			retry.Close()
 		}
-		jobFail(job, 4, "SSH lost after wifi reload",
+		jobFail(job, 5, "SSH lost after wifi reload",
 			"SSH connection lost after wifi reload and could not be re-established — wireless config rolled back if the router was reachable")
 		return false
 	}
@@ -865,7 +906,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 	if !up {
 		job.addLog("WiFi STA verification failed — wwan interface not up")
 		rollbackWireless(client)
-		jobFail(job, 4, "WiFi connection failed — check SSID and password",
+		jobFail(job, 5, "WiFi connection failed — check SSID and password",
 			"WiFi STA connection failed for \""+ssid+"\" — check SSID and password (wireless config rolled back)")
 		return false
 	}
@@ -922,7 +963,7 @@ func configureSTA(job *Job, pclient **ssh.Client, ip, password, ssid, wifiPass s
 		}
 	}
 
-	job.setStep(4, "done", "STA mode: "+ssid)
+	job.setStep(5, "done", "STA mode: "+ssid)
 	return true
 }
 
@@ -1030,6 +1071,241 @@ func httpGetFileOrEmpty(url string) []byte {
 		return nil
 	}
 	return data
+}
+
+// stageAssetURLs returns the ordered list of asset URLs a PreStage run must
+// download for the given router state:
+//
+//   - stock GL.iNet router that will be flashed (isStockGL): the OpenWrt
+//     sysupgrade image for the detected model (when known) PLUS the
+//     tollgate-wrt package in BOTH formats — the post-flash package manager
+//     is only known after the reboot, and staging both guarantees a cache
+//     hit whichever one the install step probes.
+//   - router already on OpenWrt: only the package format matching its live
+//     package manager (apk vs opkg). An empty/unknown pkgMgr stages both so
+//     the deploy still works offline.
+//
+// Unknown GL models contribute no image URL (the flash step reports its own
+// actionable "unknown model" error); the package formats are still staged so
+// an operator can fix the model table and re-deploy offline.
+func stageAssetURLs(isStockGL bool, glModel, pkgMgr string) []string {
+	urls := []string{}
+	if isStockGL {
+		if img, ok := glModelMap[glModel]; ok {
+			urls = append(urls, img.URL())
+		}
+		urls = append(urls, tollgatePkgURL, tollgatePkgAPKURL)
+		return urls
+	}
+	switch pkgMgr {
+	case "apk":
+		urls = append(urls, tollgatePkgAPKURL)
+	case "opkg":
+		urls = append(urls, tollgatePkgURL)
+	default: // unknown — stage both so a later probe hits the cache
+		urls = append(urls, tollgatePkgURL, tollgatePkgAPKURL)
+	}
+	return urls
+}
+
+// runPreStage is the PreStage wiring point called from runDeployment right
+// after verify (so glModel/isStockGL are known) and before flash. It probes
+// the router's package manager (when the router is already OpenWrt — a stock
+// GL.iNet router will be flashed to the pinned OpenWrt release whose package
+// manager stageAssetURLs covers by staging both formats), picks the asset
+// URLs for the router state, and stages them into the Job's stageCache.
+// Failures are logged but non-fatal: the flash/install steps keep their
+// live-fetch → router-wget → feed fallbacks on a cache miss.
+func runPreStage(job *Job, client *ssh.Client, isStockGL bool, glModel string) {
+	pkgMgr := ""
+	if !isStockGL && client != nil {
+		pkgMgr = strings.TrimSpace(sshRun(client, "command -v apk >/dev/null 2>&1 && echo apk || echo opkg"))
+	}
+	urls := stageAssetURLs(isStockGL, glModel, pkgMgr)
+	if len(urls) == 0 {
+		job.addLog("PreStage: nothing to stage for this router state")
+		return
+	}
+	job.addLog(fmt.Sprintf("PreStage: downloading %d asset(s) to staging cache...", len(urls)))
+	failed := stageAssets(job, urls)
+	if len(failed) > 0 {
+		for _, u := range failed {
+			job.addLog("PreStage: could not stage " + truncate(u, 100) + " — deploy will fall back to live download")
+		}
+	}
+	staged := len(urls) - len(failed)
+	job.addLog(fmt.Sprintf("PreStage: %d/%d asset(s) staged", staged, len(urls)))
+}
+
+// stageAssets downloads every URL in urls into the Job's stageCache (keyed
+// by the exact URL) unless that URL is already staged. Already-cached URLs
+// are skipped — staging is idempotent, so re-running it (e.g. a retried
+// deploy sharing the Job) performs zero network fetches. Uses
+// downloadWithRetry (3 attempts, 4xx short-circuit) for every asset, the
+// same reliability pattern as the flash-image download. Returns the URLs
+// that failed to stage; callers log them and continue, because the
+// flash/install steps fall back to live fetch → router-side wget → feed on
+// a cache miss.
+func stageAssets(job *Job, urls []string) []string {
+	var failed []string
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		if _, ok := job.stagedAsset(u); ok {
+			continue
+		}
+		// Disk re-deploy cache (Task 5): if a previous deploy to another
+		// router already staged this URL, load the persisted bytes instead of
+		// downloading again. Only version-pinned assets are eligible (see
+		// persistableDiskAsset) — a package binary is never loaded from disk,
+		// so a stale cached package can never shadow a newer release.
+		if persistableDiskAsset(u) {
+			if data, ok := loadStageDisk(u); ok {
+				job.addLog("PreStage: using disk cache for " + truncate(u, 100) + " (no download)")
+				job.stageAsset(u, data)
+				continue
+			}
+		}
+		data, err := downloadWithRetry(u, 3, 2*time.Second)
+		if err != nil || len(data) == 0 {
+			failed = append(failed, u)
+			continue
+		}
+		job.stageAsset(u, data)
+		// Write through to the disk cache so a later deploy to another router
+		// re-uses these bytes. Non-fatal: a read-only HOME or full disk must
+		// not fail the deploy — the live-fetch fallback remains for next time.
+		if persistableDiskAsset(u) {
+			if err := saveStageDisk(u, data); err != nil {
+				job.addLog("PreStage: could not persist " + truncate(u, 100) + " to disk cache: " + err.Error())
+			}
+		}
+	}
+	return failed
+}
+
+// stagedOrLiveBytes returns the bytes for a small deploy asset — the
+// tollgate-wrt package (.ipk/.apk), nodogsplash .ipk, or jq .ipk — keyed by
+// the EXACT source URL. When the PreStage step cached that URL the bytes are
+// served with zero network (the offline-install case staging exists for). On a
+// cache miss the asset is fetched live with httpGetFile — packages are small,
+// single downloads, so they intentionally do NOT use the heavier
+// downloadWithRetry path (that is reserved for the flash image, see
+// flashImageBytes in images.go); a live failure here is what triggers the
+// install step's router-side wget → feed fallback chain. The second return
+// reports whether the bytes came from the cache so callers can log the actual
+// acquisition path. A "Downloading ..." log is emitted before any live fetch
+// so the operator sees progress during the (up to 60s) download.
+func stagedOrLiveBytes(job *Job, label, url string) ([]byte, bool, error) {
+	if data, ok := job.stagedAsset(url); ok {
+		job.addLog("Using staged " + label + " from cache (no download)")
+		return data, true, nil
+	}
+	job.addLog("Downloading " + label + " (laptop-side)...")
+	data, err := httpGetFile(url)
+	return data, false, err
+}
+
+// ---- On-disk re-deploy cache (~/.tollgate-stage) ----
+//
+// The Job stageCache is in-memory and per-Job, so a second deploy to a
+// different router (a fresh Job) would re-download every asset. Task 5 adds a
+// small on-disk cache so re-deploys re-use previously staged binaries.
+//
+// RISK 3 (consultant): ONLY the version-pinned flash image is persisted.
+// Package binaries (tollgate-wrt .ipk/.apk, nodogsplash, jq) can change
+// between releases — a stale cached copy would shadow the newer package and
+// could install an outdated backend. The flash image URL is pinned to a fixed
+// OpenWrt release (openWrtVersion), so its bytes are stable by construction.
+
+// stageDiskDirOverride redirects the on-disk staging cache directory.
+// Non-empty in tests to keep the real home directory untouched.
+var stageDiskDirOverride = ""
+
+// stageDiskDir returns the on-disk staging cache directory: ~/.tollgate-stage
+// (or stageDiskDirOverride, set by tests to keep the real home directory
+// untouched). Empty when no home dir exists — callers then skip disk
+// persistence (in-memory cache + live fallback only).
+func stageDiskDir() string {
+	if stageDiskDirOverride != "" {
+		return stageDiskDirOverride
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".tollgate-stage")
+}
+
+// stageDiskPath returns the on-disk cache file path for an asset URL:
+// <cacheDir>/<hex sha256 of url>. Addressing by URL keeps one file per asset
+// across deploys and makes corruption detectable by size (see loadStageDisk);
+// a changed URL (new release) naturally misses and re-downloads.
+func stageDiskPath(url string) string {
+	sum := sha256.Sum256([]byte(url))
+	return filepath.Join(stageDiskDir(), hex.EncodeToString(sum[:]))
+}
+
+// persistableDiskAsset reports whether an asset URL may be written to / read
+// from the on-disk re-deploy cache. Default policy: ONLY version-pinned flash
+// images from glModelMap qualify — package binaries are never persisted
+// (consultant RISK 3, staging plan 2026-09-08). Var so tests can pin the
+// policy to a local httptest URL without network access.
+var persistableDiskAsset = func(url string) bool {
+	for _, img := range glModelMap {
+		if img.URL() == url {
+			return true
+		}
+	}
+	return false
+}
+
+// loadStageDisk returns the persisted bytes for url from the on-disk staging
+// cache. ok=false on any miss or when the file is empty/corrupt (size 0) —
+// the caller then falls back to a live download.
+func loadStageDisk(url string) ([]byte, bool) {
+	if stageDiskDir() == "" {
+		return nil, false
+	}
+	path := stageDiskPath(url)
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+	return data, true
+}
+
+// saveStageDisk persists data for url to the on-disk staging cache, creating
+// the cache directory if needed. The write is atomic (temp file + rename) so
+// a crash mid-write can never leave a truncated file that a later deploy
+// would trust as a complete image.
+func saveStageDisk(url string, data []byte) error {
+	if stageDiskDir() == "" || len(data) == 0 {
+		return nil
+	}
+	path := stageDiskPath(url)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".stage-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // extractIPKFilename scans an OpenWrt package directory listing (HTML) and

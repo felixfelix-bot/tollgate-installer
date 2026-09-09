@@ -142,6 +142,42 @@ func TestHandleDeploy(t *testing.T) {
 	}
 }
 
+func TestDeployRequestPreStageRoundTrip(t *testing.T) {
+	// Task 4: the UI checkbox sends preStage in the deploy POST body; the
+	// field must survive JSON decode into deployRequest so runDeployment
+	// can act on it (req.PreStage → runPreStage). Pin both directions plus
+	// the default (absent → false).
+	body := `{"ip":"192.168.1.1","password":"pw","lnurl":"a@b.c","mode":"sta","preStage":true}`
+	var req deployRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("decode with preStage: %v", err)
+	}
+	if !req.PreStage {
+		t.Error("preStage=true in JSON body decoded to false")
+	}
+
+	// Absent field must default to false (checkbox unchecked / WAN mode).
+	// NOTE: unmarshal into a FRESH struct — Go's json.Unmarshal does not
+	// zero absent fields, so reusing req would leak PreStage=true above.
+	bodyNoFlag := `{"ip":"192.168.1.1","password":"pw","lnurl":"a@b.c","mode":"wan"}`
+	var reqNoFlag deployRequest
+	if err := json.Unmarshal([]byte(bodyNoFlag), &reqNoFlag); err != nil {
+		t.Fatalf("decode without preStage: %v", err)
+	}
+	if reqNoFlag.PreStage {
+		t.Error("absent preStage decoded to true — WAN deploy would wrongly pre-stage")
+	}
+
+	// Marshal round-trip: the wire name is the lower-case preStage.
+	out, err := json.Marshal(deployRequest{IP: "192.168.1.1", PreStage: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"preStage":true`) {
+		t.Errorf("marshal output %s missing lower-case preStage:true", out)
+	}
+}
+
 func TestMainFunctionStructure(t *testing.T) {
 	// Test that the main function sets up routes correctly
 	// This is a basic structural test since we can't easily run the main function

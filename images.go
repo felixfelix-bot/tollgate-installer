@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // openWrtImage describes the OpenWrt sysupgrade image parameters for a
 // GL.iNet board. URL() builds the standard OpenWrt download URL:
@@ -84,4 +87,26 @@ var glModelMap = map[string]openWrtImage{
 	// qualcommax/ipq60xx
 	"gl-ax1800":  {Target: "qualcommax", Subtarget: "ipq60xx", Board: "glinet_gl-ax1800", Version: openWrtVersion},
 	"gl-axt1800": {Target: "qualcommax", Subtarget: "ipq60xx", Board: "glinet_gl-axt1800", Version: openWrtVersion},
+}
+
+// flashImageBytes returns the OpenWrt sysupgrade image bytes for imageURL,
+// preferring the Job's stageCache — populated by the PreStage step under the
+// exact asset URL — so a pre-staged flash performs ZERO network fetches (the
+// whole point of staging: the laptop may have lost its internet by flash
+// time). On a cache miss the image is downloaded live with downloadWithRetry
+// (3 attempts, exponential backoff, definitive-4xx short-circuit) — the image
+// is the largest, most failure-prone download in the deploy, so it must never
+// use the bare httpGetFile path. The acquisition path is logged so the
+// operator can see whether the flash ran offline.
+func flashImageBytes(job *Job, imageURL string) ([]byte, error) {
+	if data, ok := job.stagedAsset(imageURL); ok {
+		job.addLog("Using staged OpenWrt image from cache (no download)")
+		return data, nil
+	}
+	job.addLog("Downloading: " + imageURL)
+	data, err := downloadWithRetry(imageURL, 3, 2*time.Second)
+	if err == nil {
+		job.addLog(fmt.Sprintf("Downloaded %d KB", len(data)/1024))
+	}
+	return data, err
 }

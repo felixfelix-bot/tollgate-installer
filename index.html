@@ -97,6 +97,17 @@
   }
   .radio-card:hover { border-color: #f7931a; }
   .radio-card.selected { border-color: #f7931a; background: rgba(247,147,26,0.1); color: #f7931a; }
+  /* Pre-download toggle (must override the full-width `input` styling above) */
+  .precheck {
+    display: flex; align-items: flex-start; gap: 0.6rem;
+    margin-bottom: 1.2rem; cursor: pointer; user-select: none;
+  }
+  .precheck input[type=checkbox] {
+    width: auto; min-width: 0; padding: 0; margin: 3px 0 0; flex-shrink: 0;
+    background: transparent; border: none; border-radius: 0;
+    accent-color: #f7931a;
+  }
+  .precheck .precheck-text { font-size: 0.85rem; color: #e8eaf6; line-height: 1.4; }
   /* Advanced settings collapsible */
   .advanced {
     margin: 1rem 0; border: 1px solid rgba(255,255,255,0.1);
@@ -208,6 +219,11 @@
       </div>
     </details>
 
+    <label class="precheck" for="prestage" id="prestage-field">
+      <input type="checkbox" id="prestage">
+      <span class="precheck-text">Pre-download required packages before deploy (needed if the laptop's only internet is via the router being flashed)</span>
+    </label>
+
     <button class="btn" id="deploy-btn" onclick="startDeploy()" disabled>Deploy TollGate</button>
     <button class="btn btn-secondary" onclick="scanAgain()">Scan again</button>
   </div>
@@ -252,6 +268,12 @@ function selectMode(mode) {
   document.getElementById('mode-wan').classList.toggle('selected', mode === 'wan');
   document.getElementById('mode-sta').classList.toggle('selected', mode === 'sta');
   document.getElementById('sta-fields').classList.toggle('hidden', mode !== 'sta');
+  // Pre-download default: in STA (WiFi repeater) mode the laptop is a WLAN
+  // client whose only internet may be the router being flashed/reconfigured,
+  // so it can lose connectivity mid-deploy — pre-download by default. WAN
+  // (Ethernet) mode keeps the laptop's own uplink, so default off. The
+  // operator can still override the checkbox either way.
+  document.getElementById('prestage').checked = (mode === 'sta');
   if (mode === 'sta' && !wifiScanned) {
     wifiScan();
   }
@@ -458,6 +480,7 @@ async function startDeploy() {
     devSplit: parseInt(document.getElementById('devsplit').value, 10),
     margin: parseInt(document.getElementById('margin').value, 10),
     mint: document.getElementById('mint').value,
+    preStage: document.getElementById('prestage').checked,
   };
 
   const resp = await fetch('/api/deploy', {
