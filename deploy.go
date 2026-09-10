@@ -21,6 +21,9 @@ const (
 	// tollgatePackage is the opkg/apk package name for the tollgate-wrt
 	// package (installed via the OpenWrt feed fallback path).
 	tollgatePackage = "tollgate-wrt"
+)
+
+var (
 	// tollgate-wrt .ipk download URL (OpenWrt <= 24.10 opkg back-compat).
 	//
 	// NOTE (v0.5.0 de-brand): the tollgate-wrt package now ships from the
@@ -30,13 +33,14 @@ const (
 	//
 	// NOTE (feat/feed-per-arch-urls): the per-arch selectable URLs are derived
 	// generically in arch.go via feedAssetURL (feed-primary, GitHub fallback).
-	// These two consts are the aarch64_cortex-a53 PRIMARY feed assets, used by
+	// These two vars are the aarch64_cortex-a53 PRIMARY feed assets, used by
 	// the PreStage cache (stageAssetURLs) to pre-download the bench arch in both
-	// formats before arch detection runs at install time.
-	tollgatePkgURL = "https://github.com/FreedomTechFeed/packages/releases/download/v0.6.0-alpha1/tollgate-wrt_0.6.0_alpha1_aarch64_cortex-a53.ipk"
+	// formats before arch detection runs at install time. They are DERIVED from
+	// feedAssetURL so they can never drift from the generic URL builder.
+	tollgatePkgURL = feedAssetURL("aarch64_cortex-a53", ".ipk")
 	// tollgate-wrt .apk download URL (OpenWrt 25+ with APK support).
 	// OpenWrt 25.12+ cannot install legacy .ipk (ar archive) packages.
-	tollgatePkgAPKURL = "https://github.com/FreedomTechFeed/packages/releases/download/v0.6.0-alpha1/tollgate-wrt_0.6.0_alpha1_aarch64_cortex-a53.apk"
+	tollgatePkgAPKURL = feedAssetURL("aarch64_cortex-a53", ".apk")
 )
 
 // deploySteps returns the ordered deployment step definitions.
