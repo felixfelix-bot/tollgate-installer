@@ -143,7 +143,7 @@ func TestHandleDeploy(t *testing.T) {
 }
 
 func TestDeployRequestPreStageRoundTrip(t *testing.T) {
-	// Task 4: the UI checkbox sends preStage in the deploy POST body; the
+	// The UI always sends preStage:true (pre-download is automatic); the
 	// field must survive JSON decode into deployRequest so runDeployment
 	// can act on it (req.PreStage → runPreStage). Pin both directions plus
 	// the default (absent → false).
