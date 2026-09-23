@@ -892,8 +892,9 @@ async function pollStatus(jobId) {
   job.steps.forEach(step => {
     const div = document.createElement('div');
     // 'warn' is a completed step whose outcome needs the operator's attention
-    // (e.g. the installed package could NOT be checked against a published
-    // digest) — deliberately not the same mark as a verified 'done'.
+    // (e.g. the installed package is not the requested release, or could NOT be
+    // checked against a published digest) — deliberately not the same mark as a
+    // verified 'done'.
     const icon = step.status === 'done' ? '\u2713' : step.status === 'warn' ? '\u26A0' : step.status === 'running' ? '\u25CF' : step.status === 'failed' ? '\u2717' : '\u25CB';
     div.innerHTML =
       '<div class="step">' +
