@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-shot manual router test for v0.6.0-alpha2-rc17-scanpre3.
+# One-shot manual router test for v0.6.0-alpha2-rc17-scanpre4.
 # Usage: curl -fsSL <raw-url> | bash
 #
 # Downloads the SHA256-verified prerelease binary for this OS/arch, checks it
 # against the published SHA256SUMS, and launches the wizard.
 set -euo pipefail
 
-V=v0.6.0-alpha2-rc17-scanpre3
+V=v0.6.0-alpha2-rc17-scanpre4
 REPO=felixfelix-bot/tollgate-installer
 BASE="https://github.com/$REPO/releases/download/$V"
 
@@ -44,9 +44,15 @@ echo " Open the URL it prints in your browser, pick your router,"
 echo " and deploy."
 echo
 echo " If it stalls: leave it running and send me the terminal"
-echo " output. A wedged router now fails the job with a reason"
+echo " output. A wedged router fails the job with a reason"
 echo " instead of spinning forever (30s SSH deadline + 3min"
 echo " no-progress watchdog)."
+echo
+echo " If it fails AFTER the service restart with 'lost the SSH"
+echo " transport': that is the wizard's own restart reloading"
+echo " router networking under it. It now re-acquires the"
+echo " session for up to 120s before giving up — send me the"
+echo " output either way."
 echo "======================================================"
 echo
 exec "./$f" -port "${TG_PORT:-8099}"
