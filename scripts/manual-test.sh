@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-shot manual router test for v0.6.0-alpha2-rc17-scanpre4.
+# One-shot manual router test for v0.6.0-alpha2-rc17-scanpre5.
 # Usage: curl -fsSL <raw-url> | bash
 #
 # Downloads the SHA256-verified prerelease binary for this OS/arch, checks it
 # against the published SHA256SUMS, and launches the wizard.
 set -euo pipefail
 
-V=v0.6.0-alpha2-rc17-scanpre4
+V=v0.6.0-alpha2-rc17-scanpre5
 REPO=felixfelix-bot/tollgate-installer
 BASE="https://github.com/$REPO/releases/download/$V"
 
