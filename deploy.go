@@ -1282,6 +1282,21 @@ func runDeployment(job *Job, req deployRequest) {
 	// Step 6: Install tollgate package from GitHub releases
 	// OpenWrt 25+ uses apk; OpenWrt 24.x uses opkg. Detect at runtime.
 	job.setStep(6, "running", "")
+
+	// PRE-INSTALL DOWNGRADE GUARD (card t_92d09f78, operator directive
+	// 2026-10-05: "no more downgrades"). Read what the router already runs
+	// BEFORE any package byte moves: if the requested release is OLDER,
+	// refuse right here — the post-install verify below can only flag the
+	// mismatch AFTER the router was already moved backwards. A router with
+	// no tollgate-wrt installed passes (nothing to downgrade — e.g. the
+	// GL-AR300M16), an equal version passes (idempotent redeploy), and a
+	// probe that died on the transport fails the step with the real error —
+	// never a silent skip. The pre-number is compared NUMERICALLY
+	// (pre22 > pre9 — a plain string compare gets exactly this wrong).
+	installedPkgVer, installedProbeErr := readInstalledPkgVersionE(client)
+	if refuseOlderRequestedRelease(job, client, staCommitted, installedPkgVer, installedProbeErr, feedReleaseTag) {
+		return
+	}
 	pkgMgr := strings.TrimSpace(sshRun(client, "command -v apk >/dev/null 2>&1 && echo apk || echo opkg"))
 
 	// Auto-detect the router's CPU architecture and select the matching
@@ -2104,6 +2119,64 @@ func refuseMissingRequestedRelease(job *Job, client *ssh.Client, staCommitted, p
 	jobFail(job, 6,
 		"requested release "+requestedTag+" unavailable — refusing to install an older package",
 		refusal.Error())
+	return true
+}
+
+// refuseOlderRequestedRelease is the PRE-install downgrade guard of deploy
+// step 6 (card t_92d09f78, operator directive 2026-10-05: "no more
+// downgrades"). It runs BEFORE any package byte moves: the caller probes the
+// installed tollgate-wrt version (readInstalledPkgVersionE), this gate
+// decides, and the install proceeds only on a pass.
+//
+// Three outcomes, mirroring the fail-loud gate above:
+//
+//   - the requested release is provably OLDER than what the router already
+//     runs → REFUSE: log the reason, restore the pre-deploy wireless
+//     snapshot (same exit as every other step-6 terminal failure — the
+//     operator contract is "failed deploy leaves the router as found, radios
+//     usable for a re-run", and a downgrade refusal is exactly such a
+//     failure), and fail the step naming BOTH versions.
+//   - the probe could not read the version at all (probeErr != nil: every
+//     probe leg died on the transport) → FAIL LOUDLY with the real error,
+//     through the shared restore-first exit. Silently skipping the guard on
+//     a transport error would trade a detectable failure for the exact
+//     silent downgrade the directive forbids.
+//   - anything else (blank router — nothing to downgrade; equal version —
+//     idempotent redeploy; newer requested — the upgrade case; installed
+//     version the comparator cannot order — not proof of a downgrade) →
+//     pass. The decision function's reason is logged when non-empty, so the
+//     log always states what the guard decided and why.
+//
+// Returns true when the caller MUST stop (refused or probe-dead); false when
+// the install may continue. A nil job is a programming error in the caller —
+// fail closed (stop) without touching the job.
+func refuseOlderRequestedRelease(job *Job, client *ssh.Client, staCommitted bool, installed string, probeErr error, requestedTag string) bool {
+	if job == nil {
+		return true
+	}
+	if probeErr != nil {
+		// Unreadable is NOT "not installed": the guard must not silently
+		// skip. The shared exit restores the wireless snapshot first —
+		// post-step-5, an unreadable-version failure is a terminal failure
+		// like any other.
+		job.addLog("ERROR: could not read the installed tollgate-wrt version to guard against a downgrade: " + probeErr.Error())
+		jobFailAfterRestore(job, client, staCommitted, 6,
+			"could not read the installed tollgate-wrt version",
+			"the downgrade guard could not read the already-installed tollgate-wrt version: "+probeErr.Error())
+		return true
+	}
+	refuse, reason := installDowngradeVerdict(installed, requestedTag)
+	if reason != "" {
+		job.addLog("Downgrade guard: " + reason)
+	}
+	if !refuse {
+		return false
+	}
+	job.addLog("ERROR: " + reason)
+	restoreWirelessOnFailure(job, client, staCommitted)
+	jobFail(job, 6,
+		"refusing to install an older release: router already runs "+installed+", requested "+requestedTag,
+		reason+". Re-run with TOLLGATE_FEED_RELEASE_TAG set to "+requestedTag+"'s successor or newer (the feed's newest release is the default), or remove the installed tollgate-wrt first (opkg remove tollgate-wrt / apk remove tollgate-wrt) if you really want to go back.")
 	return true
 }
 

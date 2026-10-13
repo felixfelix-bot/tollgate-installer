@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -953,19 +955,409 @@ func parsePkgVersionFromOpkg(out, name string) string {
 // distinguishes feed releases and is what proves an upgrade took effect.
 // Best-effort: "" when the router cannot report one.
 func readInstalledPkgVersion(client *ssh.Client) string {
+	v, _ := readInstalledPkgVersionE(client)
+	return v
+}
+
+// readInstalledPkgVersionE is readInstalledPkgVersion with the error surfaced.
+// The PRE-INSTALL downgrade guard (refuseOlderRequestedRelease, card
+// t_92d09f78) needs the distinction the best-effort spelling collapses: a
+// router that answered "no tollgate-wrt installed" (blank — nothing to
+// downgrade, guard passes) is a different fact from a router whose version
+// could not be read at all (unreadable — the guard must fail the step with
+// the real error, never silently skip). The post-install verify reads keep
+// the best-effort spelling above.
+func readInstalledPkgVersionE(client *ssh.Client) (string, error) {
 	if client == nil {
-		return ""
+		// Same wording sshRunE uses, so the operator sees one reason for a
+		// dead transport, not two.
+		return "", errors.New("no SSH client — the router connection was lost (relocation, reboot, or a moved cable)")
 	}
-	if v := parsePkgVersionFromApkDB(
-		sshRun(client, "cat /lib/apk/db/installed 2>/dev/null"),
-		tollgatePackage,
-	); v != "" {
-		return v
+	dbOut, dbErr := sshRunE(client, "cat /lib/apk/db/installed 2>/dev/null")
+	opkgOut, opkgErr := sshRunE(client, "opkg list-installed "+tollgatePackage+" 2>/dev/null")
+	return pkgVersionFromLegs(dbOut, dbErr, opkgOut, opkgErr)
+}
+
+// pkgVersionFromLegs is the pure decision core of readInstalledPkgVersionE:
+// given the outputs and errors of the two probe legs (apk db, then opkg), it
+// returns the installed version, whether the read is TRUSTED, and the
+// transport error when it is not.
+//
+//   - a version found on either leg wins (the apk db leg is tried first,
+//     mirroring readInstalledPkgVersion's ladder);
+//   - no version with at least one leg completing on a live transport means
+//     NOT INSTALLED (trusted "" — e.g. the GL-AR300M16: opkg answers, and
+//     reports nothing for tollgate-wrt);
+//   - every leg dying on the transport means UNREADABLE: the error of the
+//     first dead leg is carried verbatim so the caller fails with the real
+//     reason instead of treating the router as blank.
+//
+// A leg that RAN to a nonzero exit (ssh.ExitError — `cat` on a router with
+// no apk db, `opkg` missing on an apk router) still proved the transport
+// alive: that is a completed leg (see probeLegTransportFailed).
+func pkgVersionFromLegs(dbOut string, dbErr error, opkgOut string, opkgErr error) (version string, err error) {
+	if v := parsePkgVersionFromApkDB(dbOut, tollgatePackage); v != "" {
+		return v, nil
 	}
-	return parsePkgVersionFromOpkg(
-		sshRun(client, "opkg list-installed "+tollgatePackage+" 2>/dev/null"),
-		tollgatePackage,
-	)
+	if v := parsePkgVersionFromOpkg(opkgOut, tollgatePackage); v != "" {
+		return v, nil
+	}
+	// No version anywhere. That fact is only usable when the router was
+	// reachable: at least one probe leg must have completed on a live
+	// transport, else the "" is a hole in the evidence, not a fact.
+	dbAlive := !probeLegTransportFailed(dbErr)
+	opkgAlive := !probeLegTransportFailed(opkgErr)
+	if dbAlive || opkgAlive {
+		return "", nil
+	}
+	if dbErr != nil {
+		return "", dbErr
+	}
+	return "", opkgErr
+}
+
+// probeLegTransportFailed classifies a probe leg's error: did the leg prove
+// the transport ALIVE (it ran to a remote exit status — even a nonzero one)
+// or is the transport itself dead/gone?
+//
+// A remote command exiting nonzero (ssh.ExitError from session.CombinedOutput
+// on opkg-less or apk-db-less routers — the two most common leg outcomes on
+// fresh OpenWrt) means the router answered. Everything else — nil client,
+// NewSession failures, the runBounded timeout, a reset connection — means
+// the transport is gone and the "" read must not be trusted.
+func probeLegTransportFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		// The command ran on the router; its nonzero exit is an answer.
+		return false
+	}
+	return true
+}
+
+// ─── pre-install downgrade guard: version ordering ───────────────────────────
+//
+// The operator directive (2026-10-05) is "no more downgrades". The
+// post-install assertion (pkgVersionVerdict) only fires AFTER the package
+// manager already moved the router backwards; this ordering vocabulary is
+// what the PRE-install half uses to refuse before any byte moves.
+//
+// The feed's own release history is the trap that makes a naive compare
+// wrong: v0.6.0-alpha2-pre9 and v0.6.0-alpha4-pre22 sort LEXICOGRAPHICALLY
+// as "pre9" > "pre22" (the character '9' > '2'), so a string compare would
+// call a downgrade an upgrade. The pre-number must be compared NUMERICALLY.
+
+// prereleaseLabelRank orders the label vocabulary the feed actually uses
+// (alpha < beta < rc), verified against the feed's publish order:
+// v0.6.0-rc1 (2026-10-11 19:55) was published AFTER v0.6.0-rc1-pre31
+// (18:38), and the alpha4 series followed the alpha2 series. Unknown labels
+// are ordered before all known ones, alphabetically among themselves, so
+// the comparator stays total over plausibly-shaped versions.
+var prereleaseLabelRank = map[string]int{
+	"alpha": 0,
+	"beta":  1,
+	"rc":    2,
+}
+
+// comparePkgVersions orders two tollgate-wrt release identifiers (tags or
+// package-version spellings) and reports whether the pair was orderable at
+// all. It is a PURE function: the guard's unit tests exercise it with no
+// router involved, and the step-6 wiring only consumes its verdict.
+//
+// Accepted spellings (all observed in the wild on routers or in the feed):
+//
+//	v0.6.0-alpha4-pre22          feed tag
+//	0.6.0_alpha4_pre22-r1        apk db / opkg spelling (hyphens flattened
+//	                             to underscores, packaging -rN suffix)
+//	v0.5.0                       GitHub fallback control-file spelling
+//
+// Ordering rules, each pinned by a table case in downgrade_guard_test.go:
+//
+//   - the numeric core compares field-wise, padded (0.6.0.1 > 0.6.0);
+//   - a final release (no prerelease part) is newer than any prerelease of
+//     the same core (0.6.0 > 0.6.0-alpha4-pre22);
+//   - prerelease labels rank alpha < beta < rc, label numbers NUMERIC
+//     (alpha10 > alpha9 — the same trap as pre9/pre22, one label up);
+//   - within a label series, pre-numbers are NUMERIC and a bare label
+//     finalises its own pre-series: v0.6.0-rc1 was published after
+//     v0.6.0-rc1-pre31, so rc1 > rc1-pre31; while the bare opener
+//     v0.6.0-alpha2-pre (published before alpha2-pre2) is the series
+//     START, so pre < pre2;
+//   - the opkg/apk release suffix (-r1) is packaging, not release: ignored.
+//
+// Not comparable (ok=false): a string that is not version-shaped at all
+// (empty, or no leading numeric core like "snapshot-20261013" / "latest").
+// The caller must treat that as "no proof of a downgrade", never as equal.
+func comparePkgVersions(a, b string) (cmp int, ok bool) {
+	pa, aOK := parsePkgVersionParts(a)
+	pb, bOK := parsePkgVersionParts(b)
+	if !aOK || !bOK {
+		return 0, false
+	}
+	if c := cmpPkgVersionCores(pa.core, pb.core); c != 0 {
+		return c, true
+	}
+	return cmpPkgPrerelease(pa, pb), true
+}
+
+// pkgVersionParts is the decomposed shape of a tollgate-wrt release
+// identifier: the numeric core fields and the prerelease label + number.
+type pkgVersionParts struct {
+	core []int
+	// label is the prerelease vocabulary word ("alpha", "beta", "rc") with
+	// its optional number in labelNum ("alpha4", "rc1"), plus the optional
+	// pre-number of the label series (pre22 in alpha4-pre22, held in preNum
+	// with hasPre=true). hasPre=false is a bare label ("rc1", "alpha4").
+	label    string
+	labelNum int
+	preNum   int
+	hasPre   bool
+}
+
+// parsePkgVersionParts decomposes a tag or package-version spelling into
+// core + prerelease parts. ok=false when the string carries no numeric core
+// at all — the caller's "cannot order" case.
+func parsePkgVersionParts(v string) (pkgVersionParts, bool) {
+	s := strings.TrimSpace(v)
+	s = strings.TrimPrefix(s, "v")
+	// Normalize the apk/opkg spelling seam FIRST (hyphens flattened to
+	// underscores by feedPkgVersionForTag) so ONE parser serves both
+	// spellings — and so the release-suffix strip below also sees the
+	// all-underscore variant.
+	s = strings.ReplaceAll(s, "_", "-")
+	// Strip the opkg/apk release suffix (-r1): packaging, not release.
+	s = trimPkgRelease(s)
+	if s == "" {
+		return pkgVersionParts{}, false
+	}
+	dash := strings.Index(s, "-")
+	coreStr, preStr := s, ""
+	if dash >= 0 {
+		coreStr, preStr = s[:dash], s[dash+1:]
+	}
+	var core []int
+	for _, f := range strings.Split(coreStr, ".") {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return pkgVersionParts{}, false
+		}
+		core = append(core, n)
+	}
+	if len(core) == 0 {
+		return pkgVersionParts{}, false
+	}
+	var parts pkgVersionParts
+	parts.core = core
+	// Decompose the prerelease when there is one: label(alpha|beta|rc)
+	// + number, then an optional preN tail. "alpha4-pre22", "rc1",
+	// "pre" (the bare series opener), "pre2". A final release has no
+	// prerelease part at all and stays zero-valued (label == "").
+	if preStr != "" {
+		for _, seg := range strings.Split(preStr, "-") {
+			if seg == "" {
+				return pkgVersionParts{}, false
+			}
+			// The preN tail.
+			if strings.HasPrefix(seg, "pre") {
+				tail := strings.TrimPrefix(seg, "pre")
+				if tail == "" {
+					// The bare opener label (alpha2-pre): series START.
+					parts.hasPre = true
+					parts.preNum = 0
+					continue
+				}
+				n, err := strconv.Atoi(tail)
+				if err != nil {
+					return pkgVersionParts{}, false
+				}
+				parts.hasPre = true
+				parts.preNum = n
+				continue
+			}
+			// A label or label+number ("alpha", "alpha4", "rc", "rc1").
+			label, num := seg, 0
+			if i := firstDigitIndex(seg); i > 0 && i < len(seg) {
+				n, err := strconv.Atoi(seg[i:])
+				if err != nil {
+					return pkgVersionParts{}, false
+				}
+				label, num = seg[:i], n
+			}
+			parts.label = label
+			parts.labelNum = num
+		}
+	}
+	return parts, true
+}
+
+// trimPkgRelease strips the opkg/apk release suffix from a version spelling
+// ("-r1" in "0.6.0_alpha4_pre22-r1"): it is packaging iteration, not
+// release identity, and must not affect ordering (pinned: 0.5.0-r1 == 0.5.0).
+func trimPkgRelease(v string) string {
+	// Match "-r" + digits at the very end only.
+	if i := strings.LastIndex(v, "-r"); i > 0 && isAllDigits(v[i+2:]) {
+		return v[:i]
+	}
+	return v
+}
+
+// isAllDigits reports whether s is one or more ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// firstDigitIndex returns the index of the first ASCII digit in s, or len(s)
+// when there is none. "alpha4" → 5, "rc1" → 2, "beta" → 4, "pre2" → 3.
+func firstDigitIndex(s string) int {
+	for i := range len(s) {
+		if s[i] >= '0' && s[i] <= '9' {
+			return i
+		}
+	}
+	return len(s)
+}
+
+// cmpPkgVersionCores compares two numeric cores field-wise, shorter padded
+// with zeros (0.6.0 == 0.6.0.0; 0.6.0.1 > 0.6.0).
+func cmpPkgVersionCores(a, b []int) int {
+	for i := 0; i < len(a) || i < len(b); i++ {
+		av, bv := 0, 0
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		if av != bv {
+			if av < bv {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// cmpPkgPrerelease orders two prerelease parts of the SAME core by the
+// vocabulary the feed actually publishes (see prereleaseLabelRank):
+//
+//   - no prerelease > any prerelease (a final release finalises its series);
+//   - label rank alpha < beta < rc; unknown labels sort before known ones,
+//     alphabetically among themselves (total order over plausible shapes);
+//   - within a label, the label number is NUMERIC (alpha10 > alpha9);
+//   - within a label+number, the pre-series is NUMERIC and a bare label
+//     (no preN) finalises its own series: rc1 > rc1-pre31, while the bare
+//     opener pre (preNum=0 via hasPre) is the series start: pre < pre2.
+func cmpPkgPrerelease(a, b pkgVersionParts) int {
+	// Final release beats any prerelease.
+	if a.label == "" && b.label == "" {
+		return 0
+	}
+	if a.label == "" {
+		return 1
+	}
+	if b.label == "" {
+		return -1
+	}
+	// Label vocabulary rank.
+	ra, aKnown := prereleaseLabelRank[a.label]
+	rb, bKnown := prereleaseLabelRank[b.label]
+	if !aKnown && !bKnown {
+		// Both unknown: alphabetical, deterministic.
+		if a.label != b.label {
+			if a.label < b.label {
+				return -1
+			}
+			return 1
+		}
+	} else if aKnown != bKnown {
+		// Unknown labels order before the known vocabulary.
+		if aKnown {
+			return 1
+		}
+		return -1
+	} else if ra != rb {
+		if ra < rb {
+			return -1
+		}
+		return 1
+	}
+	// Label numbers are numeric (alpha10 > alpha9).
+	if a.labelNum != b.labelNum {
+		if a.labelNum < b.labelNum {
+			return -1
+		}
+		return 1
+	}
+	// The pre-series. A bare label (hasPre=false) finalises its series, so
+	// it orders after every preN of the same label+number; a bare opener
+	// (hasPre=true, preNum=0) is the series start.
+	if !a.hasPre && !b.hasPre {
+		return 0
+	}
+	if !a.hasPre {
+		return 1
+	}
+	if !b.hasPre {
+		return -1
+	}
+	if a.preNum != b.preNum {
+		if a.preNum < b.preNum {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// installDowngradeVerdict is the guard's pure decision function: given the
+// version reported by the router and the requested release tag, should the
+// deploy REFUSE, and with what operator-facing reason?
+//
+//   - older requested → refuse, naming BOTH versions (the requested tag
+//     exactly as the operator asked for it, and the installed spelling
+//     exactly as the router reported it);
+//   - blank installed → pass: there is nothing to downgrade (a fresh
+//     OpenWrt without tollgate-wrt, e.g. the GL-AR300M16);
+//   - equal → pass: an idempotent redeploy is not a downgrade;
+//   - newer requested → pass: the upgrade case, the deploy's whole job;
+//   - an installed version the comparator cannot order (not version-shaped)
+//     → pass, but with a reason naming both strings so the log says the
+//     guard ran and could not order — the post-install verify step still
+//     has its own say over what actually landed.
+//
+// The caller decides what a refusal means (refuseOlderRequestedRelease
+// restores the wireless snapshot and fails the step); this function owns
+// ONLY the decision, so the table above is testable with no router.
+func installDowngradeVerdict(installed, requestedTag string) (refuse bool, reason string) {
+	if installed == "" {
+		// Nothing installed: there is nothing to downgrade. This must NOT be
+		// reported as a comparable "" (the parser would reject it anyway) —
+		// it is the blank-router pass the card demands.
+		return false, ""
+	}
+	cmp, ok := comparePkgVersions(installed, requestedTag)
+	if !ok {
+		return false, fmt.Sprintf(
+			"installed tollgate-wrt reports %q, which cannot be compared with the requested release %s — not refusing (this is not proof of a downgrade), the post-install version check still applies",
+			installed, requestedTag)
+	}
+	if cmp > 0 {
+		return true, fmt.Sprintf(
+			"router already runs %s, which is NEWER than the requested release %s — refusing to downgrade",
+			installed, requestedTag)
+	}
+	return false, ""
 }
 
 // portalMissingAssets extracts the /assets paths reported missing by the step-8
