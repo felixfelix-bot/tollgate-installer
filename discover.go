@@ -135,6 +135,51 @@ func tcpProbe(ip string, port int, timeout time.Duration) bool {
 	return true
 }
 
+// parseGLInetRelease parses the contents of /etc/gl-inet-release from stock
+// GL.iNet firmware. The format is NOT guaranteed to be stable: it may be
+// key=value lines (model=..., version=...) OR a single bare product string.
+// Handle both defensively. Returns the model and version (version may be
+// empty if the file carries no version line).
+func parseGLInetRelease(glOut string) (model, version string) {
+	lines := strings.Split(glOut, "\n")
+
+	// First pass: extract model/version from key=value lines.
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		low := strings.ToLower(line)
+		if strings.Contains(low, "model") || strings.Contains(low, "product") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) > 1 {
+				model = strings.Trim(parts[1], " 	\"'")
+			}
+		}
+		if strings.Contains(low, "version") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) > 1 {
+				version = strings.Trim(parts[1], " 	\"'")
+			}
+		}
+	}
+
+	// If no model was found via key=value, fall back to a bare product string:
+	// the first non-empty line that is not itself a key=value line. This covers
+	// the single-product-string format (e.g. "GL-MT3000") and mixed formats.
+	if model == "" {
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.Contains(line, "=") {
+				continue
+			}
+			model = line
+			break
+		}
+	}
+	return model, version
+}
+
 // sshIdentify tries passwordless SSH to read firmware info.
 func sshIdentify(ip, password string) (firmware, vendor, model string) {
 	client := sshConnect(ip, password)
@@ -159,11 +204,36 @@ func sshIdentify(ip, password string) (firmware, vendor, model string) {
 		}
 	}
 
-	// Try to get model
-	modelOut := sshRun(client, "cat /tmp/sysinfo/board_name 2>/dev/null || cat /tmp/sysinfo/model 2>/dev/null")
-	modelOut = strings.TrimSpace(modelOut)
-	if modelOut != "" {
-		model = modelOut
+	// If not OpenWrt, check for stock GL.iNet firmware. The /etc/gl-inet-release
+	// format is NOT verified against a real device (no GL.iNet reachable from
+	// this network at implementation time) — the parser is defensive and handles
+	// both key=value lines and a bare product string.
+	if vendor == "" {
+		glOut := sshRun(client, "cat /etc/gl-inet-release 2>/dev/null || echo ''")
+		glOut = strings.TrimSpace(glOut)
+		if glOut != "" {
+			vendor = "GL.iNet"
+			firmware = "stock"
+			glModel, glVersion := parseGLInetRelease(glOut)
+			if glModel != "" {
+				model = glModel
+			}
+			if glVersion != "" {
+				firmware = "GL.iNet " + glVersion
+			}
+			// Normalize: lowercase, spaces -> dashes (e.g. "GL-MT3000" -> "gl-mt3000").
+			model = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(model), " ", "-"))
+		}
+	}
+
+	// Try to get model from OpenWrt sysinfo (only if not already identified
+	// from a GL.iNet release file, which takes precedence).
+	if model == "" {
+		modelOut := sshRun(client, "cat /tmp/sysinfo/board_name 2>/dev/null || cat /tmp/sysinfo/model 2>/dev/null")
+		modelOut = strings.TrimSpace(modelOut)
+		if modelOut != "" {
+			model = modelOut
+		}
 	}
 
 	return
