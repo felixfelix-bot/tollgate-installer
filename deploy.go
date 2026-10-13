@@ -1971,6 +1971,13 @@ if [ -f "$D/logo192.png" ]; then echo "OK:$n"; else echo "OK_NO_ICON:$n"; fi`)
 		return
 	}
 
+	// The deploy succeeded: the resolver fallback (if it ran) is now part of
+	// the router's WORKING configuration and must stay applied — so drop only
+	// its snapshot scratch (dnsFallbackCleanupCmd). The files are what a later
+	// failed run would read as a "pre-deploy" baseline; leaving them would let
+	// that run restore the dead resolvers the deploy just replaced.
+	sshRun(client, dnsFallbackCleanupCmd)
+
 	job.mu.Lock()
 	job.Status = "done"
 	job.mu.Unlock()
@@ -1987,6 +1994,18 @@ if [ -f "$D/logo192.png" ]; then echo "OK:$n"; else echo "OK_NO_ICON:$n"; fi`)
 // /etc/config/wireless is back to its pre-deploy bytes.
 var wirelessRollback = func(client *ssh.Client) { rollbackWireless(client) }
 
+// dnsRollback is the resolver-restore side effect of the SAME terminal-failure
+// paths, indirected for the same reason: rollbackDNS takes a live *ssh.Client, so
+// only the CALL is testable in-process.
+var dnsRollback = func(client *ssh.Client) { rollbackDNS(client) }
+
+// rollbackDNS restores the two dnsmasq options the step-5 resolver fallback
+// rewrote (see rollbackDNSCmd). It is snapshot-guarded ON THE ROUTER, so a deploy
+// that never applied the fallback runs a command that touches nothing — the same
+// "absent snapshot is a no-op" contract rollbackWirelessCmd has, which is what
+// lets one exit serve both without keeping a second decision in the host.
+func rollbackDNS(client *ssh.Client) { sshRun(client, rollbackDNSCmd) }
+
 // restoreWirelessOnFailure restores the pre-deploy /etc/config/wireless snapshot
 // when THIS run committed wireless config (deploy step 5, STA mode) and reports
 // whether it did. It is the single place that decision is made, so no terminal
@@ -2002,10 +2021,22 @@ var wirelessRollback = func(client *ssh.Client) { rollbackWireless(client) }
 //     snapshot exists, so there is nothing to restore and nothing to claim: the
 //     rollback is skipped and the log stays truthful.
 //
+// It also reverts the step-5 resolver fallback's DHCP rewrite through the SAME
+// exit (dnsRollback): the fallback mutates the router's dnsmasq config, and the
+// failure contract is that a failed deploy leaves the router as it was found —
+// not committed radios, and not a rewritten resolver either. The revert is
+// snapshot-guarded ON THE ROUTER (rollbackDNSCmd), so a deploy that never
+// applied the fallback (WAN mode, healthy upstream, DNS-blocked network, or a
+// failure before step 5's upstreamOnline probe) runs a command that touches
+// nothing. The DNS restore runs regardless of the staCommitted gate because the
+// fallback can run in WAN mode too — its own snapshot decides whether there is
+// anything to undo.
+//
 // rollbackWireless is itself snapshot-guarded on the router ([ -f
 // /tmp/wireless.pre-tollgate ] && ...), so an absent or stale snapshot is a
 // no-op there as well.
 func restoreWirelessOnFailure(job *Job, client *ssh.Client, staCommitted bool) bool {
+	dnsRollback(client)
 	if !staCommitted {
 		return false
 	}
@@ -2419,6 +2450,145 @@ func upstreamVerdict(pingOK, dnsOK, defaultRoute, publicDNSOK bool) string {
 	}
 }
 
+// ─── Step-5 resolver fallback (dead upstream resolvers) ─────────────────────
+//
+// Why this exists (operator hardware, scanpre5, 2026-10-05/06): guest-style
+// upstreams hand out resolvers they do not serve. The router then has a default
+// route and answers ping, but its own lookups fail while a public resolver
+// answers:
+//
+//	ping(1.1.1.1)=true dns(github.com)=false default-route=true public-dns=true
+//	resolv.auto: nameserver 1.1.1.1 nameserver 1.0.0.1 nameserver 192.168.2.1
+//
+// upstreamVerdict calls that "fixable on the router: point dnsmasq at 1.1.1.1",
+// so the installer applies it — and has to be able to undo it.
+//
+// CRITICAL (noresolv): setting `dhcp.@dnsmasq[0].server=<pub>` ALONE does not
+// change what dnsmasq resolves. OpenWrt's dnsmasq reads the upstream's resolvers
+// out of /tmp/resolv.conf.d/resolv.conf.auto as well, and on the field router
+// those dead servers won: `nslookup github.com` kept failing, dnsOK stayed false,
+// and the deploy rolled its wireless back at step 5 even though
+// `nslookup github.com 1.1.1.1` answered. `noresolv=1` makes dnsmasq ignore that
+// file and use ONLY the explicit `server=` entries — which is the fix the verdict
+// text promised and the one that was missing.
+//
+// CRITICAL (revert): this rewrites the router's DHCP config, and the deploy's
+// failure contract is "the router is left as it was found"
+// (docs/deploy-failure-rollback.md). Snapshotting the two options it rewrites is
+// part of the fallback, not an extra: a failed deploy must not leave a rewritten
+// resolver config any more than it may leave committed radios. The revert runs
+// from the same single exit as the wireless restore (restoreWirelessOnFailure)
+// and is snapshot-guarded on the router, so a deploy that never applied the
+// fallback does nothing there.
+
+// dnsFallbackResolvers is the ordered list of public resolvers the fallback
+// probes and points dnsmasq at — the same two the verdict text names.
+var dnsFallbackResolvers = []string{"1.1.1.1", "9.9.9.9"}
+
+// Snapshot files for the two dnsmasq options the fallback rewrites. The `.state`
+// file records whether the option EXISTED (the value file then holds its value,
+// item-per-line for the list) or was ABSENT (the revert deletes it) — the same
+// existence+value shape the STA script uses for network.wwan, because uci has no
+// per-option export.
+const (
+	dnsmasqServerValueFile   = "/tmp/dhcp.dnsmasq.server.pre-tollgate"
+	dnsmasqServerStateFile   = "/tmp/dhcp.dnsmasq.server.state"
+	dnsmasqNoresolvValueFile = "/tmp/dhcp.dnsmasq.noresolv.pre-tollgate"
+	dnsmasqNoresolvStateFile = "/tmp/dhcp.dnsmasq.noresolv.state"
+)
+
+// snapshotUciOption returns the router-side shell fragment that records option's
+// current value into valueFile and whether it existed into stateFile. The
+// snapshot must run BEFORE the mutation it protects.
+//
+// It is FIRST-WRITER-WINS ([ -f state ] guards the write): upstreamOnline can
+// run twice on configureSTA's reload-retry path and so can the fallback, and an
+// unconditional re-snapshot on the second application would record the FIRST
+// application's own rewrite (server=<pub>, noresolv=1) as the "pre-deploy"
+// baseline — the revert would then faithfully restore the deploy's own
+// mutation instead of the router's original resolvers.
+func snapshotUciOption(option, valueFile, stateFile string) string {
+	return "if [ -f " + stateFile + " ]; then :; " + // already snapshotted — keep the true baseline
+		"elif uci -q get " + option + " >" + valueFile + " 2>/dev/null; then echo EXISTED > " + stateFile + "; " +
+		"else : > " + valueFile + "; echo ABSENT > " + stateFile + "; fi; "
+}
+
+// dnsFallbackApplyCmd is the exact router command the fallback runs: snapshot the
+// two options it rewrites, add the public resolver as a server= (keeping the
+// existing del_list/add_list shape), set noresolv so dnsmasq stops consulting the
+// dead resolv.conf.auto, commit, restart dnsmasq.
+//
+// Pure (one string in, one string out) so the unit suite pins the command text
+// without a router — this is what was missing when the command was an inline
+// literal: nothing asserted on it, so noresolv could be absent.
+func dnsFallbackApplyCmd(resolver string) string {
+	return snapshotUciOption("dhcp.@dnsmasq[0].server", dnsmasqServerValueFile, dnsmasqServerStateFile) +
+		snapshotUciOption("dhcp.@dnsmasq[0].noresolv", dnsmasqNoresolvValueFile, dnsmasqNoresolvStateFile) +
+		"uci -q del_list dhcp.@dnsmasq[0].server='" + resolver + "' 2>/dev/null; " +
+		"uci -q add_list dhcp.@dnsmasq[0].server='" + resolver + "' && " +
+		"uci -q set dhcp.@dnsmasq[0].noresolv='1' && " +
+		"uci commit dhcp && " +
+		"/etc/init.d/dnsmasq restart 2>/dev/null; sleep 3"
+}
+
+// rollbackDNSCmd undoes dnsFallbackApplyCmd: it puts back EXACTLY the two options
+// that command rewrote (deleted when they did not exist before, else their
+// pre-change value — the list items individually), commits and restarts dnsmasq,
+// then drops the snapshot files.
+//
+// Snapshot-guarded on the router (`[ -f <state file> ]`), exactly like
+// rollbackWirelessCmd: when this run never applied the fallback there is no
+// snapshot, so the command touches nothing and does not restart dnsmasq.
+//
+// CRITICAL (list restore): uci -q get prints a list option as ONE
+// space-separated line, so the restore must iterate WORDS, not lines — a
+// line-based loop would re-add the entire pre-deploy list as a SINGLE server
+// entry.
+const rollbackDNSCmd = `if [ -f ` + dnsmasqServerStateFile + ` ] || [ -f ` + dnsmasqNoresolvStateFile + ` ]; then ` +
+	`if [ -f ` + dnsmasqServerStateFile + ` ]; then ` +
+	`if [ "$(cat ` + dnsmasqServerStateFile + `)" = "ABSENT" ]; then uci -q delete dhcp.@dnsmasq[0].server; ` +
+	`else uci -q delete dhcp.@dnsmasq[0].server; for s in $(cat ` + dnsmasqServerValueFile + `); do uci -q add_list dhcp.@dnsmasq[0].server="$s"; done; fi; ` +
+	`fi; ` +
+	`if [ -f ` + dnsmasqNoresolvStateFile + ` ]; then ` +
+	`if [ "$(cat ` + dnsmasqNoresolvStateFile + `)" = "ABSENT" ]; then uci -q delete dhcp.@dnsmasq[0].noresolv; ` +
+	`else uci -q set dhcp.@dnsmasq[0].noresolv="$(cat ` + dnsmasqNoresolvValueFile + `)"; fi; ` +
+	`fi; ` +
+	`uci commit dhcp; /etc/init.d/dnsmasq restart 2>/dev/null; ` +
+	`rm -f ` + dnsmasqServerStateFile + ` ` + dnsmasqServerValueFile + ` ` + dnsmasqNoresolvStateFile + ` ` + dnsmasqNoresolvValueFile + `; ` +
+	`fi; true`
+
+// dnsFallbackCleanupCmd drops the fallback's snapshot scratch, run when the
+// deploy SUCCEEDS: at that point the rewrite is part of the working
+// configuration and must stay applied, so the pre-deploy baseline it captured
+// is dead — leaving the files around would let a LATER failed run "restore"
+// that baseline and delete the resolver the operator is now using
+// (docs/resolver-fallback.md). rm -f is a no-op when the fallback never ran.
+const dnsFallbackCleanupCmd = `rm -f ` + dnsmasqServerStateFile + ` ` + dnsmasqServerValueFile + ` ` + dnsmasqNoresolvStateFile + ` ` + dnsmasqNoresolvValueFile + ` 2>/dev/null; true`
+
+// dnsFallbackPlan is the pure description of the resolver fallback: which public
+// resolver dnsmasq is pointed at, the exact router command that snapshots and
+// applies it, and the exact command that undoes it.
+type dnsFallbackPlan struct {
+	resolver string
+	apply    string
+	revert   string
+}
+
+// planDNSFallback is the fallback's decision, pure: the installer may rewrite the
+// router's resolver config ONLY when the upstream answers ping, the router's own
+// lookups fail, and a public resolver answers. Anything else is not a resolver
+// problem on the router (upstreamVerdict names the owner), so nothing is touched.
+func planDNSFallback(pingOK, dnsOK, publicDNSOK bool, resolver string) (dnsFallbackPlan, bool) {
+	if !pingOK || dnsOK || !publicDNSOK || strings.TrimSpace(resolver) == "" {
+		return dnsFallbackPlan{}, false
+	}
+	return dnsFallbackPlan{
+		resolver: resolver,
+		apply:    dnsFallbackApplyCmd(resolver),
+		revert:   rollbackDNSCmd,
+	}, true
+}
+
 // upstreamOnline reports whether the router can actually USE the internet
 // after the STA associates — a wwan interface can be "up" (layer-2 associated)
 // with no default route or no working DNS. It first repairs the dnsmasq
@@ -2453,14 +2623,20 @@ func upstreamOnline(client *ssh.Client) (bool, string) {
 	}
 	// Resolvers handed out by the upstream are dead; is DNS blocked outright?
 	if pingOK && !dnsOK {
-		for _, pub := range []string{"1.1.1.1", "9.9.9.9"} {
+		for _, pub := range dnsFallbackResolvers {
 			if !dnsAnswerOK(sshRun(client, "nslookup github.com "+pub+" 2>&1 | tail -3")) {
 				continue
 			}
 			publicOK = true
-			sshRun(client, "uci -q del_list dhcp.@dnsmasq[0].server='"+pub+"' 2>/dev/null; "+
-				"uci -q add_list dhcp.@dnsmasq[0].server='"+pub+"' && uci commit dhcp && "+
-				"/etc/init.d/dnsmasq restart 2>/dev/null; sleep 3")
+			// Apply the fallback ONLY when the pure decision says this is a
+			// fixable resolver problem (upstream up, router lookups fail, public
+			// answers) — planDNSFallback owns that decision and the exact
+			// command list, so the unit suite can pin both (the missing
+			// noresolv survived precisely because this was an inline literal
+			// nothing asserted on).
+			if plan, ok := planDNSFallback(pingOK, dnsOK, true, pub); ok {
+				sshRun(client, plan.apply)
+			}
 			if dnsAnswerOK(sshRun(client, "nslookup github.com 2>&1 | tail -3")) {
 				dnsOK = true
 				fallback = "resolver-fallback: dnsmasq pointed at " + pub + " (the upstream's own resolvers do not answer)"

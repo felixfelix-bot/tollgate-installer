@@ -70,14 +70,25 @@ type rollbackCall struct {
 // stubWirelessRollback replaces the rollback side effect with a recorder for one
 // test and returns the recorded calls. The original is restored via t.Cleanup so
 // a failing test cannot leak the stub into the rest of the package.
+//
+// It ALSO neutralizes dnsRollback (the resolver-revert side effect the SAME
+// terminal-failure exit runs — see deploy_dns_fallback_test.go): the tests here
+// drive restoreWirelessOnFailure with a zero-value *ssh.Client, and the DNS
+// revert's sshRun would panic on it. The DNS-revert behaviour has its own
+// recorder in stubDNSRollback; the wireless assertions here must stay about the
+// wireless seam.
 func stubWirelessRollback(t *testing.T, job *Job) *[]rollbackCall {
 	t.Helper()
 	calls := &[]rollbackCall{}
-	orig := wirelessRollback
+	orig, origDNS := wirelessRollback, dnsRollback
 	wirelessRollback = func(c *ssh.Client) {
 		*calls = append(*calls, rollbackCall{client: c, jobStatus: job.Status})
 	}
-	t.Cleanup(func() { wirelessRollback = orig })
+	dnsRollback = func(c *ssh.Client) {}
+	t.Cleanup(func() {
+		wirelessRollback = orig
+		dnsRollback = origDNS
+	})
 	return calls
 }
 
