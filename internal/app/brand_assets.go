@@ -108,6 +108,16 @@ func brandTokenFromEnv() string {
 // brandEnvValue is set from the --brand flag or TOLLGATE_BRAND at startup.
 var brandEnvValue string
 
+// firstNonEmpty returns the first non-empty value; used for flag/env pairing.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 // brandEnvName is the environment fallback for --brand. The curl|bash launcher runs this
 // binary with its own argv, so an env var is the only way it can pass a brand.
 const brandEnvName = "TOLLGATE_BRAND"

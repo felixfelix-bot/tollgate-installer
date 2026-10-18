@@ -13,6 +13,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -94,8 +96,13 @@ var (
 	// brand is the white-label token this run deploys. Empty (the default) means no brand
 	// and the unbranded path stays byte-identical. Mirrors TOLLGATE_BRAND, which the
 	// curl|bash launcher sets, so there is one convention with --trust-host-key.
-	brand      = flag.String("brand", "", "brand token to deploy (or TOLLGATE_BRAND); empty keeps the default brand")
-	listenAddr string
+	brand = flag.String("brand", "", "brand token to deploy (or TOLLGATE_BRAND); empty keeps the default brand")
+	// brandLogo and brandFavicon are the mark to show. Empty keeps the built-in wordmark,
+	// so the unbranded page stays byte-identical.
+	brandLogo    = flag.String("brand-logo", "", "logo URL/path to show instead of the built-in wordmark (or TOLLGATE_BRAND_LOGO)")
+	brandFavicon = flag.String("brand-favicon", "", "favicon URL/path to show instead of the built-in icon (or TOLLGATE_BRAND_FAVICON)")
+	brandAssets  = flag.String("brand-assets", "", "directory of brand images to serve at /assets/ (or TOLLGATE_BRAND_ASSETS)")
+	listenAddr   string
 )
 
 // defaultBindHost is the loopback interface the wizard serves on by default.
@@ -1653,7 +1660,24 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(snapshot)
 }
 
+// brandAssetDir is the caller-supplied directory of brand images (--brand-assets).
+// Empty means the wizard serves no brand files, which is the unbranded default.
+var brandAssetDir string
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	// Brand assets are served from a real directory, because the logo and favicon are
+	// files the caller supplies rather than part of the embedded page. The path is
+	// reduced to its base name so it cannot escape the directory.
+	if brandAssetDir != "" && strings.HasPrefix(r.URL.Path, "/assets/") {
+		name := filepath.Base(r.URL.Path)
+		full := filepath.Join(brandAssetDir, name)
+		if st, err := os.Stat(full); err == nil && !st.IsDir() {
+			http.ServeFile(w, r, full)
+			return
+		}
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// The UI is served from memory by a long-lived local process and changes
 	// with every installer build. A cached copy can therefore keep presenting
@@ -1661,8 +1685,36 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	// control that the current binary no longer serves, or talks to an endpoint
 	// whose request shape has since changed. Never store it.
 	w.Header().Set("Cache-Control", "no-store")
-	w.Write(indexHTML)
+	// Serve the page with the brand applied. With no brand this returns indexHTML
+	// unchanged, byte for byte, so an upstream operator's UI cannot be perturbed.
+	page := string(indexHTML)
+	if b := brandEnvValue; b != "" {
+		page = brandedHTML(page, brandLogoURL, brandFaviconURL)
+		// The title and wordmark are literals in index.html; the brand token must reach
+		// them too, or the wizard still introduces itself as TollGate.
+		page = applyBrandToChrome(page, b)
+	}
+	w.Write([]byte(page))
 }
+
+// applyBrandToChrome rewrites the chrome that index.html hard-codes: the <title>, the
+// "TollGate" aria-label, and the wordmark's visible text when it is not replaced by an
+// asset. Display spelling follows the module's rule (capitalise the first letter), so the
+// installer and load_brand() cannot disagree about a brand's name.
+func applyBrandToChrome(page, token string) string {
+	name := brandDisplaySpelling(token)
+	page = strings.ReplaceAll(page, "<title>TollGate Installer — Router Setup", "<title>"+name+" Installer — Router Setup")
+	page = strings.ReplaceAll(page, `<h1 aria-label="TollGate">`, `<h1 aria-label="`+name+`">`)
+	page = strings.ReplaceAll(page, `<title>Tollgate Installer — Router Setup`, `<title>`+name+` Installer — Router Setup`)
+	return page
+}
+
+// Brand asset slots, set by the caller (--brand-logo / --brand-favicon or the matching
+// env vars). Empty means "keep the built-in mark".
+var (
+	brandLogoURL    string
+	brandFaviconURL string
+)
 
 // configResponse is the installer's build + feed identity, served at
 // /api/config so the UI and the curl|bash launcher can show exactly which
@@ -1913,6 +1965,9 @@ func Main() {
 	if err := applyBrandFlag(*brand); err != nil {
 		log.Fatalf("%v", err)
 	}
+	brandLogoURL = firstNonEmpty(*brandLogo, os.Getenv("TOLLGATE_BRAND_LOGO"))
+	brandFaviconURL = firstNonEmpty(*brandFavicon, os.Getenv("TOLLGATE_BRAND_FAVICON"))
+	brandAssetDir = firstNonEmpty(*brandAssets, os.Getenv("TOLLGATE_BRAND_ASSETS"))
 	sshDialPort = *sshPort
 	listenAddr = listenAddress(*listenBind, *listenPort)
 	mux := http.NewServeMux()
