@@ -21,6 +21,8 @@ package app
 //     future HTML edit fails loudly here rather than silently dropping the brand.
 
 import (
+	"fmt"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -105,6 +107,37 @@ func brandTokenFromEnv() string {
 
 // brandEnvValue is set from the --brand flag or TOLLGATE_BRAND at startup.
 var brandEnvValue string
+
+// brandEnvName is the environment fallback for --brand. The curl|bash launcher runs this
+// binary with its own argv, so an env var is the only way it can pass a brand.
+const brandEnvName = "TOLLGATE_BRAND"
+
+// applyBrandFlag records the brand for this process from the --brand flag, falling back to
+// TOLLGATE_BRAND. An explicitly default token ("tollgate") is accepted and recorded as "no
+// brand", because that is a legitimate way to ask for the unbranded path; a token that
+// would not survive sanitising is REFUSED rather than silently dropped, since a silently
+// dropped brand looks like a successful branding that quietly became the default.
+func applyBrandFlag(token string) error {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		t = strings.TrimSpace(os.Getenv(brandEnvName))
+	}
+	if t == "" {
+		SetBrandToken("")
+		return nil
+	}
+	if strings.EqualFold(t, defaultBrand) {
+		// An explicit request for the default is not an error: it is how a caller says
+		// "no brand" in a script where the value comes from a variable.
+		SetBrandToken("")
+		return nil
+	}
+	if sanitizeBrandToken(t) == "" {
+		return fmt.Errorf("--brand %q is not a usable brand token (letters, digits and dashes only; %q means the default)", token, defaultBrand)
+	}
+	SetBrandToken(t)
+	return nil
+}
 
 // SetBrandToken records the brand for the current process. Called from flag parsing.
 func SetBrandToken(token string) {

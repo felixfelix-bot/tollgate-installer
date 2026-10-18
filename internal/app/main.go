@@ -90,7 +90,11 @@ var (
 	// at a fixture dropbear on an ephemeral port, so the whole
 	// scan -> refusal -> Trust -> remember path can be driven without hardware
 	// and without needing a privileged port 22 on the test host.
-	sshPort    = flag.String("ssh-port", "22", "SSH port to dial on the router (default 22; the E2E harness points this at a fixture)")
+	sshPort = flag.String("ssh-port", "22", "SSH port to dial on the router (default 22; the E2E harness points this at a fixture)")
+	// brand is the white-label token this run deploys. Empty (the default) means no brand
+	// and the unbranded path stays byte-identical. Mirrors TOLLGATE_BRAND, which the
+	// curl|bash launcher sets, so there is one convention with --trust-host-key.
+	brand      = flag.String("brand", "", "brand token to deploy (or TOLLGATE_BRAND); empty keeps the default brand")
 	listenAddr string
 )
 
@@ -1906,6 +1910,9 @@ func allRadiosUp(statusJSON string) bool {
 
 func Main() {
 	flag.Parse()
+	if err := applyBrandFlag(*brand); err != nil {
+		log.Fatalf("%v", err)
+	}
 	sshDialPort = *sshPort
 	listenAddr = listenAddress(*listenBind, *listenPort)
 	mux := http.NewServeMux()
