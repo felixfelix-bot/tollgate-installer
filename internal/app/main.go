@@ -1764,7 +1764,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		ProgressCurrent   int        `json:"progressCurrent"`
 		ProgressTotal     int        `json:"progressTotal"`
 		ProgressLabel     string     `json:"progressLabel,omitempty"`
-D
 	}{job.IP, job.Status, job.Step, steps, job.Log, localizeMessage(r, job.Error), localizeMessage(r, job.Note), localizeMessage(r, job.NoteTitle), generatedPassword,
 
 		job.credentialFile, job.progressCurrent, job.progressTotal, job.progressLabel}
