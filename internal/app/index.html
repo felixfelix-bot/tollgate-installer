@@ -515,11 +515,13 @@
          to an owner-only file whose PATH arrives as credential_file on every
          poll (see showCredentialFile). -->
     <div class="credential hidden" id="generated-credential" role="alert">
+D
       <h3 data-i18n="credential.title">The router's new root password</h3>
       <p class="credential-warn" data-i18n="credential.warnSuccess">
         Your router had no root password, so it was set to the default. The value is shown ONCE here,
         and a copy is also saved to a file on this machine (mode 600) before you close or reload this
         page. Change it to your own after you log in to the router's admin board.
+
       </p>
       <div class="credential-row">
         <code id="generated-password"></code>
@@ -567,8 +569,8 @@
       <h3 data-i18n="credential.title">The router's new root password</h3>
       <p class="credential-warn" data-i18n="credential.warnFailure">
         This deploy failed AFTER the router's root password had already been set. The value is
-        shown ONCE here, and a copy is also saved to a file on this machine (mode 600) before you close
-        or reload this page — you will need it to reach the router.
+        shown ONCE here — you will need it to reach the router. Copy it before you close or reload
+        this page; if the wizard also managed to write a recovery file, its path is named below.
       </p>
       <div class="credential-row">
         <code id="failed-generated-password"></code>
